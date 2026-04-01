@@ -152,9 +152,9 @@ export function ChatInterface() {
       </nav>
 
       {/* ── Main Layout ───────────────────────────────────────── */}
-      <div className="row flex-grow-1 g-0 overflow-hidden">
+      <div className="d-flex flex-grow-1 overflow-hidden">
         {/* ── Sidebar ─────────────────────────────────────────── */}
-        <div className="col-md-3 bg-light border-end d-flex flex-column" style={{ minWidth: 260 }}>
+        <div className="bg-light border-end d-flex flex-column flex-shrink-0" style={{ width: 280 }}>
           <ul className="nav nav-tabs px-2 pt-2">
             <li className="nav-item">
               <button
@@ -218,7 +218,7 @@ export function ChatInterface() {
         </div>
 
         {/* ── Chat Area ───────────────────────────────────────── */}
-        <div className="col d-flex flex-column">
+        <div className="d-flex flex-column flex-grow-1" style={{ minWidth: 0 }}>
           <div className="flex-grow-1 overflow-auto p-3">
             {messages.length === 0 && (
               <div className="text-center text-muted mt-5">
