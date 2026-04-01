@@ -7,7 +7,7 @@ import {
 } from '@/lib/mcp';
 import { buildToolSystemPrompt } from '@/lib/tool-processor';
 import { runChatWithTools } from '@/lib/tool-processor';
-import { readSandboxFile, ensureSandbox } from '@/lib/sandbox';
+import { readSandboxFile, ensureSandbox, listSandboxFiles } from '@/lib/sandbox';
 import type { CompletionMessage } from '@/lib/ai-client';
 
 // Register all MCP providers on first import
@@ -24,6 +24,10 @@ export async function POST(req: NextRequest) {
     };
 
     await ensureSandbox();
+
+    // ── List sandbox files so the model knows what exists ─────
+    const sandboxFiles = await listSandboxFiles('');
+    const fileList = sandboxFiles.map((f) => (f.isDirectory ? `${f.path}/` : f.path)).join(', ');
 
     // ── Bootstrap: concatenate selected file contents ─────────
     let bootstrapContext = '';
@@ -44,6 +48,9 @@ export async function POST(req: NextRequest) {
     const toolPrompt = buildToolSystemPrompt();
     const systemContent = [
       'You are a helpful AI assistant with access to a sandboxed workspace and developer tools.',
+      'You MUST use tool calls whenever the user asks you to perform an action. Never refuse or skip a tool call.',
+      '',
+      `The sandbox workspace currently contains these files: [${fileList}]`,
       '',
       toolPrompt,
       '',

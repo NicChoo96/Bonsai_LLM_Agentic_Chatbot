@@ -4,7 +4,7 @@ import type { ToolCall } from '@/types';
 
 // ─── Constants ───────────────────────────────────────────────────
 const MAX_TOOL_ITERATIONS = 8;
-const TOOL_CALL_REGEX = /<tool_call>\s*(\{[\s\S]*?\})\s*<\/tool_call>/g;
+const TOOL_CALL_REGEX = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
 
 // ─── Build the tool-instruction section for the system prompt ────
 export function buildToolSystemPrompt(): string {
@@ -24,13 +24,17 @@ export function buildToolSystemPrompt(): string {
     .join('\n\n');
 
   return `
-You have access to the following tools. To call a tool, include one or more tool-call blocks in your response exactly like this:
+You have access to the following tools. To call a tool, you MUST include a tool-call block in your response exactly like this:
 
 <tool_call>
-{"tool": "tool_name", "arguments": {"param": "value"}}
+{"tool": "tool_name", "arguments": {"path": "value"}}
 </tool_call>
 
-You may call multiple tools in a single response. After the tools run you will receive their results and can continue the conversation.
+RULES:
+- ALWAYS use tools when the user asks you to. NEVER refuse or say you cannot use a tool. Just call it.
+- All sandbox file paths are RELATIVE to the sandbox root. Example: "skills.txt", NOT "/workspace/sandbox/skills.txt".
+- If you are unsure whether a file exists, call sandbox_list_files first, then call sandbox_read_file with the correct path.
+- You may call multiple tools in a single response. After the tools run you will receive their results and can continue.
 
 ## Available Tools
 
@@ -47,10 +51,16 @@ export function parseToolCalls(content: string): ToolCall[] {
   while ((match = regex.exec(content)) !== null) {
     try {
       const parsed = JSON.parse(match[1]);
+      // Support both {"tool":"x","arguments":{...}} and flat {"tool":"x","param":"val"}
+      let args = parsed.arguments;
+      if (!args || typeof args !== 'object') {
+        const { tool, ...rest } = parsed;
+        args = rest;
+      }
       calls.push({
         id: `tc_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
         name: parsed.tool,
-        arguments: parsed.arguments || {},
+        arguments: args,
         status: 'pending',
       });
     } catch {

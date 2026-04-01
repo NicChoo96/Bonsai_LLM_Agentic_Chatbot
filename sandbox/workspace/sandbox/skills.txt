@@ -1,1 +1,0 @@
-Add skill for using http_get tool to read information from the site given in the prompt and parse it into a proper array text in JSON format.

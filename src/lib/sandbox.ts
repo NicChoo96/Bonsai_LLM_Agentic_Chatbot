@@ -8,6 +8,9 @@ const SANDBOX_ROOT = path.resolve(process.cwd(), 'sandbox');
 /** Resolve a user-supplied relative path inside the sandbox.
  *  Throws if the resolved path escapes the sandbox boundary. */
 export function resolveSandboxPath(relativePath: string): string {
+  if (!relativePath || typeof relativePath !== 'string') {
+    throw new Error('Path is required');
+  }
   // Normalise and strip leading slashes / back-slashes
   const cleaned = relativePath.replace(/^[/\\]+/, '');
   const resolved = path.resolve(SANDBOX_ROOT, cleaned);

@@ -67,6 +67,26 @@ const tools: McpToolDefinition[] = [
   },
 ];
 
+// ─── Argument Helpers ────────────────────────────────────────────
+/** Extract a path string from args – models may use "path", "file", "param", etc. */
+function extractPath(args: Record<string, unknown>): string {
+  const raw = (args.path ?? args.file ?? args.param ?? args.filepath ??
+    args.file_path ?? args.filePath ?? args.filename ??
+    Object.values(args).find((v) => typeof v === 'string')) as string | undefined;
+  if (!raw || typeof raw !== 'string') return '';
+  // Normalise separators to forward-slash
+  let cleaned = raw.replace(/\\/g, '/');
+  // Strip hallucinated absolute prefixes like /workspace/sandbox/ or /sandbox/
+  cleaned = cleaned.replace(/^.*?\/sandbox\//, '');
+  // Strip leading slashes
+  cleaned = cleaned.replace(/^\/+/, '');
+  return cleaned;
+}
+
+function extractContent(args: Record<string, unknown>): string {
+  return (args.content ?? args.text ?? args.body ?? '') as string;
+}
+
 // ─── Provider Implementation ─────────────────────────────────────
 async function execute(
   toolName: string,
@@ -75,24 +95,48 @@ async function execute(
   try {
     switch (toolName) {
       case 'sandbox_read_file': {
-        const content = await readSandboxFile(args.path as string);
-        return { success: true, data: content };
+        const p = extractPath(args);
+        if (!p) return { success: false, data: null, error: 'path is required. Use a relative path like "skills.txt" or "folder/file.md".' };
+        try {
+          const content = await readSandboxFile(p);
+          return { success: true, data: content };
+        } catch (readErr: unknown) {
+          // If file not found, list available files so the model can self-correct
+          const msg = readErr instanceof Error ? readErr.message : String(readErr);
+          if (msg.includes('ENOENT')) {
+            const available = await listSandboxFiles('');
+            const names = available.map((f) => f.path).join(', ');
+            return {
+              success: false,
+              data: null,
+              error: `File "${p}" not found. Available files in sandbox root: [${names}]. Use a relative path like "skills.txt".`,
+            };
+          }
+          throw readErr;
+        }
       }
       case 'sandbox_write_file': {
-        await writeSandboxFile(args.path as string, args.content as string);
-        return { success: true, data: `File written: ${args.path}` };
+        const p = extractPath(args);
+        if (!p) return { success: false, data: null, error: 'path is required' };
+        await writeSandboxFile(p, extractContent(args));
+        return { success: true, data: `File written: ${p}` };
       }
       case 'sandbox_list_files': {
-        const files = await listSandboxFiles((args.path as string) || '');
+        const p = extractPath(args);
+        const files = await listSandboxFiles(p || '');
         return { success: true, data: files };
       }
       case 'sandbox_delete_file': {
-        await deleteSandboxFile(args.path as string);
-        return { success: true, data: `Deleted: ${args.path}` };
+        const p = extractPath(args);
+        if (!p) return { success: false, data: null, error: 'path is required' };
+        await deleteSandboxFile(p);
+        return { success: true, data: `Deleted: ${p}` };
       }
       case 'sandbox_create_dir': {
-        await createSandboxDir(args.path as string);
-        return { success: true, data: `Directory created: ${args.path}` };
+        const p = extractPath(args);
+        if (!p) return { success: false, data: null, error: 'path is required' };
+        await createSandboxDir(p);
+        return { success: true, data: `Directory created: ${p}` };
       }
       default:
         return { success: false, data: null, error: `Unknown tool: ${toolName}` };
