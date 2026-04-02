@@ -11,7 +11,7 @@ import {
 const tools: McpToolDefinition[] = [
   {
     name: 'sandbox_read_file',
-    description: 'Read the contents of a file in the sandbox workspace.',
+    description: 'Read a file in the project sandbox workspace. For files outside the sandbox (any drive), use host_read_file instead.',
     parameters: {
       type: 'object',
       properties: {
@@ -22,7 +22,7 @@ const tools: McpToolDefinition[] = [
   },
   {
     name: 'sandbox_write_file',
-    description: 'Create or overwrite a file in the sandbox workspace.',
+    description: 'Create or overwrite a file in the project sandbox workspace. For files outside the sandbox (any drive), use host_write_file instead.',
     parameters: {
       type: 'object',
       properties: {
@@ -34,7 +34,7 @@ const tools: McpToolDefinition[] = [
   },
   {
     name: 'sandbox_list_files',
-    description: 'List files and directories in a sandbox folder.',
+    description: 'List files in the project sandbox workspace. For listing any directory on the system, use host_list_dir instead.',
     parameters: {
       type: 'object',
       properties: {
@@ -45,7 +45,7 @@ const tools: McpToolDefinition[] = [
   },
   {
     name: 'sandbox_delete_file',
-    description: 'Delete a file or directory from the sandbox workspace.',
+    description: 'Delete a file or directory from the project sandbox workspace. For deleting files anywhere on the system, use host_delete instead.',
     parameters: {
       type: 'object',
       properties: {
@@ -56,7 +56,7 @@ const tools: McpToolDefinition[] = [
   },
   {
     name: 'sandbox_create_dir',
-    description: 'Create a new directory in the sandbox workspace.',
+    description: 'Create a directory in the project sandbox workspace. For creating directories anywhere on the system, use host_create_dir instead.',
     parameters: {
       type: 'object',
       properties: {
@@ -149,7 +149,7 @@ async function execute(
 
 export const filesystemProvider: McpProvider = {
   name: 'filesystem',
-  description: 'Sandboxed file-system operations (read, write, list, delete, mkdir).',
+  description: 'Sandboxed project workspace file operations (read, write, list, delete, mkdir). For system-wide file access across all drives, use the system provider tools (host_read_file, host_write_file, host_list_dir, etc.).',
   tools,
   execute,
 };
