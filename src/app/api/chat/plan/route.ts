@@ -21,7 +21,8 @@ registerProvider(systemProvider);
 // Phase 1: understand  – parse user prompt, return understanding
 // Phase 2: gather      – collect tools + skills relevant to the task
 // Phase 3: plan        – produce a numbered step-by-step plan
-// Phase 4: execute     – run the plan steps sequentially
+// Phase 4: review      – validate the plan against the original prompt
+// Phase 5: execute     – run the plan steps sequentially
 
 export async function POST(req: NextRequest) {
   try {
@@ -33,13 +34,17 @@ export async function POST(req: NextRequest) {
       selectedFiles,
       skills,
       plan,
+      understanding,
+      gathered,
     } = body as {
-      phase: 'understand' | 'gather' | 'plan' | 'execute';
+      phase: 'understand' | 'gather' | 'plan' | 'review' | 'execute';
       userPrompt: string;
       messages: { role: string; content: string }[];
       selectedFiles: string[];
       skills: { name: string; content: string }[];
       plan: { steps: string[]; toolPlan: string };
+      understanding: any;
+      gathered: any;
     };
 
     await ensureSandbox();
@@ -434,7 +439,157 @@ export async function POST(req: NextRequest) {
     }
 
     // ════════════════════════════════════════════════════════════
-    // PHASE 4: EXECUTE
+    // PHASE 4: REVIEW (validate plan against original prompt)
+    // ════════════════════════════════════════════════════════════
+    if (phase === 'review') {
+      const allTools = getAllTools();
+      const toolDocs = allTools.map((t) => {
+        const params = Object.entries(t.parameters.properties)
+          .map(([k, v]) => `${k}: ${v.description}`)
+          .join(', ');
+        return `- ${t.name}: ${t.description} [params: ${params}]`;
+      }).join('\n');
+
+      // ── Round 1: Cross-check plan vs prompt ────────────────
+      const reviewSystemContent = [
+        'You are an AI validation assistant. Your SOLE job is to review an execution plan and verify it is CORRECT and COMPLETE before it runs.',
+        '',
+        'You will receive:',
+        '  1. The ORIGINAL user prompt (the ground truth)',
+        '  2. The AI understanding of that prompt',
+        '  3. The gathered tools/skills',
+        '  4. The proposed execution plan',
+        '',
+        'Your job is to CRITICALLY validate:',
+        '  - Does each step actually serve the user\'s original intent?',
+        '  - Are there any steps that CONTRADICT what the user asked for?',
+        '  - Are any steps MISSING that are needed to fulfill the request?',
+        '  - Are any steps REDUNDANT or wasteful?',
+        '  - Are the tool choices correct for each step? (check against available tools)',
+        '  - Are the predicted arguments CORRECT? (check param names, types, values)',
+        '  - Is the step ordering and dependencies correct?',
+        '  - Will the plan actually achieve what the user wants when executed end-to-end?',
+        '  - Are there any mistakes, hallucinated tools, or wrong assumptions?',
+        '',
+        'Respond ONLY with valid JSON:',
+        '  "verdict": "pass" | "fail" | "needs_correction"',
+        '  "issues": array of strings describing each issue found (empty if pass)',
+        '  "corrected_plan": the corrected plan object (same schema as original) if verdict is "needs_correction", or null if "pass"',
+        '  "reasoning": detailed explanation of your validation analysis',
+        '  "confidence": number 0-100 indicating how confident you are the plan will succeed',
+        '  "review_notes": what you checked and what you found',
+        '',
+        `Available tools:\n${toolDocs}`,
+      ].join('\n');
+
+      const reviewMessages: CompletionMessage[] = [
+        { role: 'system', content: reviewSystemContent },
+        {
+          role: 'user',
+          content: [
+            `=== ORIGINAL USER PROMPT ===`,
+            userPrompt,
+            '',
+            `=== AI UNDERSTANDING ===`,
+            JSON.stringify(understanding || {}, null, 2),
+            '',
+            `=== GATHERED TOOLS/SKILLS ===`,
+            JSON.stringify(gathered || {}, null, 2),
+            '',
+            `=== PROPOSED EXECUTION PLAN ===`,
+            JSON.stringify(plan || {}, null, 2),
+            '',
+            'Carefully validate this plan. Does it correctly and completely fulfill the original user prompt?',
+          ].join('\n'),
+        },
+      ];
+
+      const r1 = await sendChatCompletion(reviewMessages);
+      const r1Raw = r1.choices[0]?.message?.content ?? '{}';
+
+      const reviewRounds: { round: number; analysis: string; review_notes: string }[] = [];
+      let r1Parsed: any;
+      try { r1Parsed = JSON.parse(r1Raw); } catch { r1Parsed = { verdict: 'pass', reasoning: r1Raw }; }
+      reviewRounds.push({ round: 1, analysis: r1Raw, review_notes: r1Parsed.review_notes || 'Initial validation' });
+
+      // ── Rounds 2-3: Self-review the review itself ──────────
+      const metaReviewSystem = [
+        'You are an AI meta-reviewer. You are reviewing your OWN validation of an execution plan.',
+        'Was the previous validation thorough enough? Did it miss any issues?',
+        'Check AGAIN:',
+        '  - Re-read the original user prompt word by word',
+        '  - Re-check every step against what was actually asked',
+        '  - Re-verify tool names and argument correctness',
+        '  - Confirm the verdict is accurate',
+        '',
+        'If you find additional issues or want to change the verdict, produce an updated validation.',
+        'Respond ONLY with valid JSON with the same schema:',
+        '  "verdict": "pass" | "fail" | "needs_correction"',
+        '  "issues": array of issue strings',
+        '  "corrected_plan": corrected plan or null',
+        '  "reasoning": explanation',
+        '  "confidence": 0-100',
+        '  "review_notes": what changed in this round',
+      ].join('\n');
+
+      let latestReview = r1Raw;
+      for (let round = 2; round <= 3; round++) {
+        const roundMessages: CompletionMessage[] = [
+          { role: 'system', content: metaReviewSystem },
+          {
+            role: 'user',
+            content: [
+              `Original user prompt: "${userPrompt}"`,
+              '',
+              `Proposed plan:\n${JSON.stringify(plan || {}, null, 2)}`,
+              '',
+              `Previous validation (round ${round - 1}):\n${latestReview}`,
+              '',
+              `This is meta-review round ${round} of 3. Be thorough.`,
+            ].join('\n'),
+          },
+        ];
+
+        const rN = await sendChatCompletion(roundMessages);
+        const rNRaw = rN.choices[0]?.message?.content ?? latestReview;
+        latestReview = rNRaw;
+
+        let rNParsed: any;
+        try { rNParsed = JSON.parse(rNRaw); } catch { rNParsed = {}; }
+        reviewRounds.push({
+          round,
+          analysis: rNRaw,
+          review_notes: rNParsed.review_notes || `Meta-review round ${round}`,
+        });
+      }
+
+      // Parse final review
+      let finalReview: any;
+      try {
+        finalReview = JSON.parse(latestReview);
+      } catch {
+        finalReview = {
+          verdict: 'pass',
+          issues: [],
+          corrected_plan: null,
+          reasoning: latestReview,
+          confidence: 50,
+        };
+      }
+
+      const { review_notes: _rrn, ...publicReview } = finalReview;
+
+      return NextResponse.json({
+        phase: 'review',
+        review: publicReview,
+        // If review corrected the plan, return corrected version
+        correctedPlan: finalReview.corrected_plan || null,
+        reviewRounds,
+      });
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // PHASE 5: EXECUTE
     // ════════════════════════════════════════════════════════════
     if (phase === 'execute') {
       const toolPrompt = buildToolSystemPrompt();

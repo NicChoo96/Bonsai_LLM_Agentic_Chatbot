@@ -3,7 +3,7 @@
 import React, { useState } from 'react';
 
 // ─── Types ───────────────────────────────────────────────────────
-export type PlanPhase = 'understand' | 'gather' | 'plan' | 'execute';
+export type PlanPhase = 'understand' | 'gather' | 'plan' | 'review' | 'execute';
 
 export interface ReviewRound {
   round: number;
@@ -53,7 +53,17 @@ export interface PlanState {
   } | null;
   /** Phase 3 review rounds */
   planRounds: ReviewRound[];
-  /** Phase 4: which plan step index is executing */
+  /** Phase 4 output: plan validation */
+  review: {
+    verdict: 'pass' | 'fail' | 'needs_correction';
+    issues: string[];
+    corrected_plan: any;
+    reasoning: string;
+    confidence: number;
+  } | null;
+  /** Phase 4 review rounds */
+  reviewValidationRounds: ReviewRound[];
+  /** Phase 5: which plan step index is executing */
   executingStep: number;
   /** Error if any phase fails */
   error: string | null;
@@ -68,6 +78,8 @@ export const INITIAL_PLAN_STATE: PlanState = {
   gatheredRounds: [],
   plan: null,
   planRounds: [],
+  review: null,
+  reviewValidationRounds: [],
   executingStep: -1,
   error: null,
 };
@@ -77,6 +89,7 @@ const PHASES: { id: PlanPhase; label: string; icon: string; description: string 
   { id: 'understand', label: 'Understanding', icon: 'bi-chat-left-text', description: 'Analyzing your request…' },
   { id: 'gather', label: 'Gathering', icon: 'bi-collection', description: 'Collecting tools & skills…' },
   { id: 'plan', label: 'Planning', icon: 'bi-list-check', description: 'Building execution plan…' },
+  { id: 'review', label: 'Reviewing', icon: 'bi-shield-check', description: 'Validating plan against your request…' },
   { id: 'execute', label: 'Executing', icon: 'bi-play-circle', description: 'Running the plan…' },
 ];
 
@@ -177,7 +190,7 @@ function ReviewRoundsPanel({ rounds, label }: { rounds: ReviewRound[]; label: st
 
 export function PlanDisplay({ planState }: PlanDisplayProps) {
   const { currentPhase, completedPhases, understanding, gathered, plan, executingStep, error,
-          understandingRounds, gatheredRounds, planRounds } = planState;
+          understandingRounds, gatheredRounds, planRounds, review, reviewValidationRounds } = planState;
 
   if (!currentPhase && completedPhases.length === 0) return null;
 
@@ -365,6 +378,68 @@ export function PlanDisplay({ planState }: PlanDisplayProps) {
             </div>
 
             <ReviewRoundsPanel rounds={planRounds} label="Planning thinking" />
+          </div>
+        )}
+
+        {/* ── Phase 4 output: Review / Validation ─────────────── */}
+        {review && (
+          <div className="p-3 border-bottom">
+            <div className="d-flex align-items-center gap-2 mb-2">
+              <i className="bi bi-shield-check text-primary"></i>
+              <strong className="text-primary">Plan Review</strong>
+              <small className="text-muted ms-auto" style={{ fontSize: '0.72rem' }}>
+                <i className="bi bi-arrow-repeat me-1"></i>{reviewValidationRounds.length || 3} review rounds
+              </small>
+            </div>
+
+            {/* Verdict badge */}
+            <div className="d-flex align-items-center gap-2 mb-2">
+              <span
+                className={`badge ${
+                  review.verdict === 'pass' ? 'bg-success' :
+                  review.verdict === 'needs_correction' ? 'bg-warning text-dark' :
+                  'bg-danger'
+                }`}
+                style={{ fontSize: '0.82rem' }}
+              >
+                {review.verdict === 'pass' && <><i className="bi bi-check-circle me-1"></i>Plan Validated</>}
+                {review.verdict === 'needs_correction' && <><i className="bi bi-pencil-square me-1"></i>Corrected</>}
+                {review.verdict === 'fail' && <><i className="bi bi-x-circle me-1"></i>Failed Validation</>}
+              </span>
+              {review.confidence != null && (
+                <span className="badge bg-outline-secondary text-secondary" style={{ fontSize: '0.76rem', border: '1px solid #6c757d' }}>
+                  Confidence: {review.confidence}%
+                </span>
+              )}
+            </div>
+
+            {/* Reasoning */}
+            <p className="mb-1 text-muted" style={{ fontSize: '0.82rem' }}>{review.reasoning}</p>
+
+            {/* Issues list */}
+            {review.issues && review.issues.length > 0 && (
+              <div className="ms-2 mb-2">
+                <small className="text-muted fw-semibold">
+                  <i className="bi bi-exclamation-triangle me-1 text-warning"></i>Issues Found:
+                </small>
+                <ul className="mb-0 ps-3" style={{ fontSize: '0.84rem' }}>
+                  {review.issues.map((issue, i) => (
+                    <li key={i} className="text-danger-emphasis">{issue}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {/* Corrected plan indicator */}
+            {review.corrected_plan && (
+              <div className="ms-2">
+                <small className="text-success fw-semibold">
+                  <i className="bi bi-arrow-clockwise me-1"></i>Plan was automatically corrected before execution.
+                </small>
+              </div>
+            )}
+
+            <ReviewRoundsPanel rounds={reviewValidationRounds} label="Validation thinking" />
           </div>
         )}
 

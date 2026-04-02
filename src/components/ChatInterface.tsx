@@ -235,7 +235,29 @@ export function ChatInterface() {
       planState.planRounds = p3.reviewRounds || [];
       planState.completedPhases = ['understand', 'gather', 'plan'];
 
-      // ═══════════ PHASE 4: EXECUTE ══════════════════════════
+      // ═══════════ PHASE 4: REVIEW (validate plan) ═══════════
+      planState.currentPhase = 'review';
+      setActivePlan({ ...planState });
+
+      const p4 = await callPlanPhase('review', {
+        ...basePayload,
+        phase: 'review',
+        messages: [],
+        plan: p3.plan,
+        understanding: p1.understanding,
+        gathered: p2.gathered,
+      });
+      planState.review = p4.review;
+      planState.reviewValidationRounds = p4.reviewRounds || [];
+      planState.completedPhases = ['understand', 'gather', 'plan', 'review'];
+
+      // If the review corrected the plan, use the corrected version
+      const finalPlanForExecution = p4.correctedPlan || p3.plan;
+      if (p4.correctedPlan) {
+        planState.plan = p4.correctedPlan;
+      }
+
+      // ═══════════ PHASE 5: EXECUTE ══════════════════════════
       planState.currentPhase = 'execute';
       planState.executingStep = 0;
       setActivePlan({ ...planState });
@@ -247,16 +269,16 @@ export function ChatInterface() {
         content: m.content,
       }));
 
-      const p4 = await callPlanPhase('execute', {
+      const p5 = await callPlanPhase('execute', {
         ...basePayload,
         phase: 'execute',
         messages: execMessages,
-        plan: p3.plan,
+        plan: finalPlanForExecution,
       });
 
       // Mark all steps done
-      planState.executingStep = (p3.plan?.steps?.length || 1);
-      planState.completedPhases = ['understand', 'gather', 'plan', 'execute'];
+      planState.executingStep = (finalPlanForExecution?.steps?.length || 1);
+      planState.completedPhases = ['understand', 'gather', 'plan', 'review', 'execute'];
       planState.currentPhase = null;
 
       const finalPlan = { ...planState };
@@ -266,13 +288,13 @@ export function ChatInterface() {
         ...prev,
         {
           role: 'assistant',
-          content: p4.reply,
-          toolCalls: p4.toolCalls,
+          content: p5.reply,
+          toolCalls: p5.toolCalls,
           planState: finalPlan,
         },
       ]);
 
-      if (p4.toolCalls?.length) refreshFiles();
+      if (p5.toolCalls?.length) refreshFiles();
     } catch (err: any) {
       planState.error = err.message || 'Plan execution failed';
       planState.currentPhase = null;
