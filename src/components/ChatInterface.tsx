@@ -31,6 +31,7 @@ export function ChatInterface() {
   const [activePlan, setActivePlan] = useState<PlanState>(INITIAL_PLAN_STATE);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const refreshFiles = useCallback(() => setFileTreeKey((k) => k + 1), []);
 
@@ -159,18 +160,25 @@ export function ChatInterface() {
   const callPlanPhase = async (
     phase: string,
     payload: Record<string, unknown>,
+    signal?: AbortSignal,
   ): Promise<any> => {
     const res = await fetch('/api/chat/plan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
+      signal,
     });
     const data = await res.json();
     if (data.error) throw new Error(data.error);
     return data;
   };
 
-  // ── Main send handler (always uses 4-phase plan pipeline) ──────
+  // ── Abort handler ───────────────────────────────────────────────
+  const handleAbort = useCallback(() => {
+    abortControllerRef.current?.abort();
+  }, []);
+
+  // ── Main send handler (always uses 5-phase plan pipeline) ──────
   const handleSend = async () => {
     const trimmed = input.trim();
     if (!trimmed || loading) return;
@@ -192,6 +200,11 @@ export function ChatInterface() {
     const planState: PlanState = { ...INITIAL_PLAN_STATE };
     setActivePlan({ ...planState });
 
+    // Create abort controller for this pipeline run
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+    const signal = abortController.signal;
+
     // Fetch current skills for planning
     let skillsData: { name: string; content: string }[] = [];
     try {
@@ -212,7 +225,8 @@ export function ChatInterface() {
       planState.currentPhase = 'understand';
       setActivePlan({ ...planState });
 
-      const p1 = await callPlanPhase('understand', { ...basePayload, phase: 'understand', messages: [] });
+      const p1 = await callPlanPhase('understand', { ...basePayload, phase: 'understand', messages: [] }, signal);
+      if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
       planState.understanding = p1.understanding;
       planState.understandingRounds = p1.reviewRounds || [];
       planState.completedPhases = ['understand'];
@@ -221,7 +235,8 @@ export function ChatInterface() {
       planState.currentPhase = 'gather';
       setActivePlan({ ...planState });
 
-      const p2 = await callPlanPhase('gather', { ...basePayload, phase: 'gather', messages: [] });
+      const p2 = await callPlanPhase('gather', { ...basePayload, phase: 'gather', messages: [] }, signal);
+      if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
       planState.gathered = p2.gathered;
       planState.gatheredRounds = p2.reviewRounds || [];
       planState.completedPhases = ['understand', 'gather'];
@@ -230,7 +245,8 @@ export function ChatInterface() {
       planState.currentPhase = 'plan';
       setActivePlan({ ...planState });
 
-      const p3 = await callPlanPhase('plan', { ...basePayload, phase: 'plan', messages: [] });
+      const p3 = await callPlanPhase('plan', { ...basePayload, phase: 'plan', messages: [] }, signal);
+      if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
       planState.plan = p3.plan;
       planState.planRounds = p3.reviewRounds || [];
       planState.completedPhases = ['understand', 'gather', 'plan'];
@@ -246,7 +262,8 @@ export function ChatInterface() {
         plan: p3.plan,
         understanding: p1.understanding,
         gathered: p2.gathered,
-      });
+      }, signal);
+      if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
       planState.review = p4.review;
       planState.reviewValidationRounds = p4.reviewRounds || [];
       planState.completedPhases = ['understand', 'gather', 'plan', 'review'];
@@ -274,7 +291,7 @@ export function ChatInterface() {
         phase: 'execute',
         messages: execMessages,
         plan: finalPlanForExecution,
-      });
+      }, signal);
 
       // Mark all steps done
       planState.executingStep = (finalPlanForExecution?.steps?.length || 1);

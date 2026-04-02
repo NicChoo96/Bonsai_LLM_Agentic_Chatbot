@@ -65,6 +65,8 @@ export interface PlanState {
   reviewValidationRounds: ReviewRound[];
   /** Phase 5: which plan step index is executing */
   executingStep: number;
+  /** Whether the user aborted the pipeline */
+  aborted: boolean;
   /** Error if any phase fails */
   error: string | null;
 }
@@ -81,6 +83,7 @@ export const INITIAL_PLAN_STATE: PlanState = {
   review: null,
   reviewValidationRounds: [],
   executingStep: -1,
+  aborted: false,
   error: null,
 };
 
@@ -96,6 +99,7 @@ const PHASES: { id: PlanPhase; label: string; icon: string; description: string 
 // ─── Component ───────────────────────────────────────────────────
 interface PlanDisplayProps {
   planState: PlanState;
+  onAbort?: () => void;
 }
 
 // ─── Collapsible review rounds sub-component ─────────────────────
@@ -188,8 +192,8 @@ function ReviewRoundsPanel({ rounds, label }: { rounds: ReviewRound[]; label: st
   );
 }
 
-export function PlanDisplay({ planState }: PlanDisplayProps) {
-  const { currentPhase, completedPhases, understanding, gathered, plan, executingStep, error,
+export function PlanDisplay({ planState, onAbort }: PlanDisplayProps) {
+  const { currentPhase, completedPhases, understanding, gathered, plan, executingStep, error, aborted,
           understandingRounds, gatheredRounds, planRounds, review, reviewValidationRounds } = planState;
 
   if (!currentPhase && completedPhases.length === 0) return null;
@@ -199,6 +203,19 @@ export function PlanDisplay({ planState }: PlanDisplayProps) {
       <div className="card-header bg-primary text-white d-flex align-items-center gap-2 py-2">
         <i className="bi bi-diagram-3"></i>
         <strong>Agent Plan</strong>
+        {aborted && (
+          <span className="badge bg-danger ms-2">Aborted</span>
+        )}
+        {currentPhase && onAbort && !aborted && (
+          <button
+            className="btn btn-sm btn-outline-light ms-auto d-flex align-items-center gap-1"
+            onClick={onAbort}
+            title="Abort the current pipeline"
+          >
+            <i className="bi bi-stop-circle"></i>
+            Abort
+          </button>
+        )}
       </div>
       <div className="card-body p-0">
         {/* ── Phase timeline ──────────────────────────────────── */}
@@ -443,8 +460,16 @@ export function PlanDisplay({ planState }: PlanDisplayProps) {
           </div>
         )}
 
+        {/* ── Aborted notice ─────────────────────────────────── */}
+        {aborted && (
+          <div className="p-3 text-danger d-flex align-items-center gap-2">
+            <i className="bi bi-stop-circle-fill"></i>
+            <span>Pipeline aborted by user{currentPhase ? ` during ${PHASES.find((p) => p.id === currentPhase)?.label || currentPhase}` : ''}.</span>
+          </div>
+        )}
+
         {/* ── Error ───────────────────────────────────────────── */}
-        {error && (
+        {error && !aborted && (
           <div className="p-3 text-danger">
             <i className="bi bi-exclamation-triangle me-1"></i>
             {error}
@@ -452,7 +477,7 @@ export function PlanDisplay({ planState }: PlanDisplayProps) {
         )}
 
         {/* ── Active phase description ────────────────────────── */}
-        {currentPhase && !error && (
+        {currentPhase && !error && !aborted && (
           <div className="p-2 text-center">
             <div className="d-flex align-items-center justify-content-center gap-2 text-muted">
               <div className="spinner-border spinner-border-sm" style={{ width: 14, height: 14 }} />

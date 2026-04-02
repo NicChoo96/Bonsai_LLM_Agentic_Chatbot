@@ -132,28 +132,15 @@ export async function POST(req: NextRequest) {
       // ── Rounds 2-4: Self-review loop ───────────────────────
       const reviewSystemContent = [
         'You are an AI self-review assistant. You are reviewing your OWN previous analysis of a user request.',
-        'Your job is to CRITIQUE and IMPROVE the analysis. For each review round:',
-        '  - Is anything MISSING from the requirements?',
-        '  - Is the summary accurate and complete?',
-        '  - Are there requirements listed that are actually unnecessary or wrong?',
-        '  - Did the previous round overlook any edge cases?',
-        '  - Can the requirements be more specific or actionable?',
-        '  - Are the assumptions valid?',
-        '  - TOOLS: Are the suggested tools actually the best fit? Are any missing? Are any unnecessary?',
-        '  - SKILLS: Are the suggested skills relevant? Should any existing skill be used differently? Should a new skill be created?',
-        '  - Is the tool_skill_reasoning sound? Would a different combination work better?',
+        'Critique and IMPROVE:',
+        '  - Missing/wrong/unnecessary requirements?',
+        '  - Summary accurate? Assumptions valid? Edge cases missed?',
+        '  - Are suggested_tools the best fit? Any missing or unnecessary?',
+        '  - Are suggested_skills relevant? Should new ones be created?',
         '',
-        'Produce an IMPROVED version of the analysis as the same JSON object:',
-        '  "summary", "requirements", "context_needed", "assumptions", "risks", "alternative_approaches",',
-        '  "suggested_tools", "suggested_skills", "tool_skill_reasoning"',
-        '',
-        'Also add a field "review_notes": a short string describing what you changed/improved in this round.',
-        '',
-        'Respond ONLY with valid JSON. No markdown, no explanation.',
-        '',
-        `Available tools:\n${toolSummary}`,
-        '',
-        `Available skills:\n${skillSummary}`,
+        'Produce an IMPROVED version as the same JSON object with all original fields.',
+        'Add "review_notes": short string describing changes.',
+        'Respond ONLY with valid JSON.',
       ].join('\n');
 
       let latestAnalysis = r1Raw;
@@ -234,15 +221,18 @@ export async function POST(req: NextRequest) {
         content: s.content,
       }));
 
+      // Compact tool summary: one line per tool with param names
+      const toolCompact = toolList.map((t) => `- ${t.name} (${t.parameters.join(', ')}): ${t.description.slice(0, 100)}`).join('\n');
+
       // Ask the model which tools and skills are relevant
       const systemContent = [
         'You are an AI planning assistant. Given the user request and available tools/skills, select which ones are relevant.',
         'Respond ONLY with valid JSON:',
-        '  "selected_tools": array of tool name strings that are relevant',
-        '  "selected_skills": array of skill name strings that are relevant',
-        '  "reasoning": brief explanation of why these were selected',
+        '  "selected_tools": array of tool name strings',
+        '  "selected_skills": array of skill name strings',
+        '  "reasoning": brief explanation',
         '',
-        `Available tools:\n${JSON.stringify(toolList, null, 2)}`,
+        `Available tools:\n${toolCompact}`,
         '',
         `Available skills:\n${skillList.map((s) => `- ${s.name}`).join('\n') || '(none)'}`,
       ].filter(Boolean).join('\n');
@@ -262,23 +252,11 @@ export async function POST(req: NextRequest) {
       // ── Rounds 2-3: Self-review of tool selection ──────────
       const gatherReviewSystem = [
         'You are an AI self-review assistant reviewing your OWN tool/skill selection.',
-        'Critique the previous selection:',
-        '  - Are any selected tools unnecessary for this task?',
-        '  - Are any critical tools MISSING that should be included?',
-        '  - Is the skill selection appropriate?',
-        '  - Is the reasoning accurate and complete?',
+        'Critique: any tools unnecessary? Any critical tools MISSING? Skill selection appropriate?',
         '',
         'Produce an IMPROVED version as JSON:',
-        '  "selected_tools": array of tool name strings',
-        '  "selected_skills": array of skill name strings',
-        '  "reasoning": brief explanation',
-        '  "review_notes": what you changed/improved',
-        '',
+        '  "selected_tools", "selected_skills", "reasoning", "review_notes"',
         'Respond ONLY with valid JSON.',
-        '',
-        `Available tools:\n${JSON.stringify(toolList, null, 2)}`,
-        '',
-        `Available skills:\n${skillList.map((s) => `- ${s.name}`).join('\n') || '(none)'}`,
       ].join('\n');
 
       let latestGather = raw;
@@ -378,22 +356,17 @@ export async function POST(req: NextRequest) {
       // ── Rounds 2-3: Self-review of plan ────────────────────
       const planReviewSystem = [
         'You are an AI self-review assistant reviewing your OWN execution plan.',
-        'Critique the previous plan:',
-        '  - Are steps in the right order? Are dependencies correct?',
-        '  - Are any steps missing or redundant?',
-        '  - Are the tool choices optimal for each step?',
-        '  - Are the predicted arguments correct?',
-        '  - Is the plan too verbose or too vague? Each step should be concrete and actionable.',
+        'Critique:',
+        '  - Steps in right order? Dependencies correct?',
+        '  - Any steps missing or redundant?',
+        '  - Tool choices optimal? Predicted arguments correct?',
+        '  - Each step concrete and actionable?',
         '',
         'Produce an IMPROVED version as JSON:',
         '  "steps": array of { step, action, tool, args, depends_on }',
         '  "summary": one-line summary',
-        '  "review_notes": what you changed/improved',
-        '',
+        '  "review_notes": what changed',
         'Respond ONLY with valid JSON.',
-        '',
-        `Available tools:\n${toolDocs}`,
-        skillDocs ? `\nAvailable skills:\n${skillDocs}` : '',
       ].filter(Boolean).join('\n');
 
       let latestPlan = raw;
@@ -450,36 +423,30 @@ export async function POST(req: NextRequest) {
         return `- ${t.name}: ${t.description} [params: ${params}]`;
       }).join('\n');
 
+      // Build compact tool reference (names only) for validation
+      const toolNames = allTools.map((t) => t.name).join(', ');
+
       // ── Round 1: Cross-check plan vs prompt ────────────────
       const reviewSystemContent = [
-        'You are an AI validation assistant. Your SOLE job is to review an execution plan and verify it is CORRECT and COMPLETE before it runs.',
+        'You are an AI validation assistant. Verify the execution plan is CORRECT and COMPLETE.',
         '',
-        'You will receive:',
-        '  1. The ORIGINAL user prompt (the ground truth)',
-        '  2. The AI understanding of that prompt',
-        '  3. The gathered tools/skills',
-        '  4. The proposed execution plan',
-        '',
-        'Your job is to CRITICALLY validate:',
-        '  - Does each step actually serve the user\'s original intent?',
-        '  - Are there any steps that CONTRADICT what the user asked for?',
-        '  - Are any steps MISSING that are needed to fulfill the request?',
-        '  - Are any steps REDUNDANT or wasteful?',
-        '  - Are the tool choices correct for each step? (check against available tools)',
-        '  - Are the predicted arguments CORRECT? (check param names, types, values)',
-        '  - Is the step ordering and dependencies correct?',
-        '  - Will the plan actually achieve what the user wants when executed end-to-end?',
-        '  - Are there any mistakes, hallucinated tools, or wrong assumptions?',
+        'Validate:',
+        '  - Each step serves the user\'s original intent',
+        '  - No steps contradict, are missing, or are redundant',
+        '  - Tool choices correct (only use tools from the available list)',
+        '  - Arguments correct (param names, types, values)',
+        '  - Step ordering and dependencies correct',
+        '  - Plan achieves what user wants end-to-end',
         '',
         'Respond ONLY with valid JSON:',
         '  "verdict": "pass" | "fail" | "needs_correction"',
-        '  "issues": array of strings describing each issue found (empty if pass)',
-        '  "corrected_plan": the corrected plan object (same schema as original) if verdict is "needs_correction", or null if "pass"',
-        '  "reasoning": detailed explanation of your validation analysis',
-        '  "confidence": number 0-100 indicating how confident you are the plan will succeed',
-        '  "review_notes": what you checked and what you found',
+        '  "issues": array of issue strings (empty if pass)',
+        '  "corrected_plan": corrected plan object if "needs_correction", else null',
+        '  "reasoning": validation analysis',
+        '  "confidence": 0-100',
+        '  "review_notes": what you checked',
         '',
-        `Available tools:\n${toolDocs}`,
+        `Available tool names: ${toolNames}`,
       ].join('\n');
 
       const reviewMessages: CompletionMessage[] = [
@@ -487,19 +454,15 @@ export async function POST(req: NextRequest) {
         {
           role: 'user',
           content: [
-            `=== ORIGINAL USER PROMPT ===`,
-            userPrompt,
+            `USER PROMPT: ${userPrompt}`,
             '',
-            `=== AI UNDERSTANDING ===`,
-            JSON.stringify(understanding || {}, null, 2),
+            `UNDERSTANDING: ${JSON.stringify(understanding || {})}`,
             '',
-            `=== GATHERED TOOLS/SKILLS ===`,
-            JSON.stringify(gathered || {}, null, 2),
+            `GATHERED: ${JSON.stringify(gathered || {})}`,
             '',
-            `=== PROPOSED EXECUTION PLAN ===`,
-            JSON.stringify(plan || {}, null, 2),
+            `PLAN: ${JSON.stringify(plan || {})}`,
             '',
-            'Carefully validate this plan. Does it correctly and completely fulfill the original user prompt?',
+            'Validate this plan against the original prompt.',
           ].join('\n'),
         },
       ];
@@ -514,22 +477,12 @@ export async function POST(req: NextRequest) {
 
       // ── Rounds 2-3: Self-review the review itself ──────────
       const metaReviewSystem = [
-        'You are an AI meta-reviewer. You are reviewing your OWN validation of an execution plan.',
-        'Was the previous validation thorough enough? Did it miss any issues?',
-        'Check AGAIN:',
-        '  - Re-read the original user prompt word by word',
-        '  - Re-check every step against what was actually asked',
-        '  - Re-verify tool names and argument correctness',
-        '  - Confirm the verdict is accurate',
+        'You are an AI meta-reviewer reviewing your OWN validation of an execution plan.',
+        'Was the previous validation thorough? Did it miss issues?',
+        'Re-read the original prompt word by word, re-check every step, confirm the verdict.',
         '',
-        'If you find additional issues or want to change the verdict, produce an updated validation.',
-        'Respond ONLY with valid JSON with the same schema:',
-        '  "verdict": "pass" | "fail" | "needs_correction"',
-        '  "issues": array of issue strings',
-        '  "corrected_plan": corrected plan or null',
-        '  "reasoning": explanation',
-        '  "confidence": 0-100',
-        '  "review_notes": what changed in this round',
+        'Respond ONLY with valid JSON:',
+        '  "verdict", "issues", "corrected_plan", "reasoning", "confidence", "review_notes"',
       ].join('\n');
 
       let latestReview = r1Raw;
@@ -541,11 +494,11 @@ export async function POST(req: NextRequest) {
             content: [
               `Original user prompt: "${userPrompt}"`,
               '',
-              `Proposed plan:\n${JSON.stringify(plan || {}, null, 2)}`,
+              `Plan: ${JSON.stringify(plan || {})}`,
               '',
               `Previous validation (round ${round - 1}):\n${latestReview}`,
               '',
-              `This is meta-review round ${round} of 3. Be thorough.`,
+              `Meta-review round ${round} of 3. Be thorough.`,
             ].join('\n'),
           },
         ];
@@ -592,7 +545,16 @@ export async function POST(req: NextRequest) {
     // PHASE 5: EXECUTE
     // ════════════════════════════════════════════════════════════
     if (phase === 'execute') {
-      const toolPrompt = buildToolSystemPrompt();
+      // Build selective tool docs: only include tools referenced in the plan
+      const planToolNames = new Set<string>();
+      if (plan?.steps?.length) {
+        for (const s of plan.steps as any[]) {
+          if (s.tool && s.tool !== 'none') planToolNames.add(s.tool);
+        }
+      }
+      // Always include a few core tools for fallback
+      ['sandbox_list_files', 'sandbox_read_file', 'search_files'].forEach((t) => planToolNames.add(t));
+      const toolPrompt = buildToolSystemPrompt(planToolNames);
 
       const skillContext = (skills || []).length > 0
         ? `\n\nLoaded Skills:\n${skills.map((s) => `[Skill: ${s.name}]\n${s.content}`).join('\n---\n')}`
