@@ -621,6 +621,66 @@ async function smartFind(
 }
 
 /**
+ * Score how well a found file matches the original query.
+ * Returns a detailed match analysis for each result so the AI can decide.
+ */
+function scoreMatch(
+  query: string,
+  foundPath: string,
+): { path: string; filename: string; extension: string; matchScore: number; matchType: string; warnings: string[] } {
+  const filename = path.basename(foundPath);
+  const extension = path.extname(foundPath).toLowerCase();
+  const queryLower = query.toLowerCase();
+  const filenameLower = filename.toLowerCase();
+  const warnings: string[] = [];
+  let score = 0;
+  let matchType = 'partial';
+
+  // Exact filename match (highest score)
+  if (filenameLower === queryLower) {
+    score = 100;
+    matchType = 'exact';
+  }
+  // Filename contains the full query
+  else if (filenameLower.includes(queryLower.replace(/\.[^.]+$/, ''))) {
+    score = 80;
+    matchType = 'contains_query';
+  } else {
+    // Score based on word overlap
+    const queryWords = extractWords(query);
+    const fileWords = extractWords(filename);
+    const matchedWords = queryWords.filter((qw) =>
+      fileWords.some((fw) => fw.toLowerCase().includes(qw.toLowerCase())),
+    );
+    score = queryWords.length > 0
+      ? Math.round((matchedWords.length / queryWords.length) * 60)
+      : 10;
+    matchType = `${matchedWords.length}/${queryWords.length} words matched`;
+  }
+
+  // Check extension mismatch
+  const queryExt = path.extname(query).toLowerCase();
+  if (queryExt && queryExt !== extension) {
+    warnings.push(`Extension mismatch: wanted "${queryExt}" but found "${extension}"`);
+    score = Math.max(score - 30, 5);
+  }
+
+  // If only 1 word matched out of many, warn
+  const queryWords = extractWords(query);
+  if (queryWords.length >= 2) {
+    const fileWords = extractWords(filename);
+    const matchedCount = queryWords.filter((qw) =>
+      fileWords.some((fw) => fw.toLowerCase().includes(qw.toLowerCase())),
+    ).length;
+    if (matchedCount <= 1) {
+      warnings.push(`Only ${matchedCount} of ${queryWords.length} search words matched — this may not be the right file`);
+    }
+  }
+
+  return { path: foundPath, filename, extension, matchScore: score, matchType, warnings };
+}
+
+/**
  * Resolve a file path — if it doesn't exist, run smartFind to locate it.
  * Returns { resolved, suggestion } where resolved is the actual path if found,
  * or null with suggestion listing candidates.
@@ -1089,13 +1149,25 @@ async function execute(
         const result = await smartFind(pattern, searchRoot, 'file', maxResults);
 
         if (result.found.length > 0) {
+          // Score each result for the AI to evaluate
+          const scored = result.found.map((f) => scoreMatch(pattern, f));
+          const bestScore = Math.max(...scored.map((s) => s.matchScore));
+          const hasWarnings = scored.some((s) => s.warnings.length > 0);
+
           return {
             success: true,
             data: {
-              files: result.found,
+              results: scored,
               count: result.found.length,
               strategy: result.strategy,
               searchDir: result.searchDir,
+              bestMatchScore: bestScore,
+              verification_needed: bestScore < 70 || hasWarnings,
+              verification_hint: bestScore < 70
+                ? `⚠️ Best match score is only ${bestScore}/100. These may not be the files you want. Check carefully before proceeding.`
+                : hasWarnings
+                ? '⚠️ Some results have warnings. Review before proceeding.'
+                : '✓ Results look like good matches.',
             },
           };
         }
@@ -1111,13 +1183,20 @@ async function execute(
             const parsed = JSON.parse(allDrivesResult.stdout || '[]');
             const items = Array.isArray(parsed) ? parsed : parsed.FullName ? [parsed] : [];
             if (items.length > 0) {
+              const scored = items.map((i: any) => scoreMatch(pattern, i.FullName));
+              const bestScore = Math.max(...scored.map((s) => s.matchScore));
               return {
                 success: true,
                 data: {
-                  files: items.map((i: any) => i.FullName),
+                  results: scored,
                   count: items.length,
                   strategy: `expanded to all drives with "*${pattern}*"`,
                   searchDir: 'all drives',
+                  bestMatchScore: bestScore,
+                  verification_needed: bestScore < 70,
+                  verification_hint: bestScore < 70
+                    ? `⚠️ Best match score is only ${bestScore}/100. Review carefully.`
+                    : '✓ Results look like good matches.',
                 },
               };
             }
@@ -1135,13 +1214,18 @@ async function execute(
               const parsed = JSON.parse(wordResult.stdout || '[]');
               const items = Array.isArray(parsed) ? parsed : parsed.FullName ? [parsed] : [];
               if (items.length > 0) {
+                const scored = items.map((i: any) => scoreMatch(pattern, i.FullName));
+                const bestScore = Math.max(...scored.map((s) => s.matchScore));
                 return {
                   success: true,
                   data: {
-                    files: items.map((i: any) => i.FullName),
+                    results: scored,
                     count: items.length,
                     strategy: `all-drives word search "*${word}*"`,
                     searchDir: 'all drives',
+                    bestMatchScore: bestScore,
+                    verification_needed: true,
+                    verification_hint: `⚠️ Only found via partial word "${word}". Best score: ${bestScore}/100. These may not be what you want.`,
                   },
                 };
               }
@@ -1152,10 +1236,12 @@ async function execute(
         return {
           success: true,
           data: {
-            files: [],
+            results: [],
             count: 0,
             strategy: result.strategy,
             searchDir: result.searchDir,
+            bestMatchScore: 0,
+            verification_needed: false,
             message: `No files found matching "${pattern}". Tried: exact glob, per-word search, regex matching.`,
           },
         };
