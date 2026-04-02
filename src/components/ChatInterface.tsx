@@ -313,15 +313,26 @@ export function ChatInterface() {
 
       if (p5.toolCalls?.length) refreshFiles();
     } catch (err: any) {
-      planState.error = err.message || 'Plan execution failed';
-      planState.currentPhase = null;
-      setActivePlan({ ...planState });
-
-      setMessages((prev) => [
-        ...prev,
-        { role: 'assistant', content: `Error during planning: ${planState.error}` },
-      ]);
+      const isAbort = err?.name === 'AbortError' || signal.aborted;
+      if (isAbort) {
+        planState.aborted = true;
+        planState.currentPhase = null;
+        setActivePlan({ ...planState });
+        setMessages((prev) => [
+          ...prev,
+          { role: 'assistant', content: 'Pipeline aborted.', planState: { ...planState } },
+        ]);
+      } else {
+        planState.error = err.message || 'Plan execution failed';
+        planState.currentPhase = null;
+        setActivePlan({ ...planState });
+        setMessages((prev) => [
+          ...prev,
+          { role: 'assistant', content: `Error during planning: ${planState.error}` },
+        ]);
+      }
     } finally {
+      abortControllerRef.current = null;
       setLoading(false);
     }
   };
@@ -504,7 +515,7 @@ export function ChatInterface() {
 
             {loading && (
               <>
-                <PlanDisplay planState={activePlan} />
+                <PlanDisplay planState={activePlan} onAbort={handleAbort} />
                 {!activePlan.currentPhase && (
                   <div className="d-flex align-items-center gap-2 text-muted ms-2 mb-2">
                     <div className="spinner-border spinner-border-sm" />
