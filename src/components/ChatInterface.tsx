@@ -6,11 +6,13 @@ import { FileExplorer } from './FileExplorer';
 import { FileSelector } from './FileSelector';
 import { MarkdownEditor } from './MarkdownEditor';
 import { ToolCallDisplay } from './ToolCallDisplay';
+import { PlanDisplay, INITIAL_PLAN_STATE, type PlanState } from './PlanDisplay';
 
 interface Message {
   role: 'user' | 'assistant';
   content: string;
   toolCalls?: any[];
+  planState?: PlanState;
 }
 
 export function ChatInterface() {
@@ -22,68 +24,263 @@ export function ChatInterface() {
   const [editingFile, setEditingFile] = useState<{ path: string; content: string } | null>(null);
   const [sidebarTab, setSidebarTab] = useState<'files' | 'tools'>('files');
   const [availableTools, setAvailableTools] = useState<any[]>([]);
+  const [availableSkills, setAvailableSkills] = useState<any[]>([]);
   const [fileTreeKey, setFileTreeKey] = useState(0);
+  const [slashSuggestions, setSlashSuggestions] = useState<{ label: string; description: string; value: string }[]>([]);
+  const [slashSelectedIdx, setSlashSelectedIdx] = useState(0);
+  const [activePlan, setActivePlan] = useState<PlanState>(INITIAL_PLAN_STATE);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
 
   const refreshFiles = useCallback(() => setFileTreeKey((k) => k + 1), []);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+  }, [messages, activePlan]);
 
-  // Load available MCP tools on mount
+  // Load available MCP tools and skills on mount
   useEffect(() => {
     fetch('/api/mcp/execute')
       .then((r) => r.json())
       .then((data) => setAvailableTools(data.tools || []))
       .catch(() => {});
+    fetch('/api/skills')
+      .then((r) => r.json())
+      .then((data) => setAvailableSkills(data.skills || []))
+      .catch(() => {});
   }, []);
 
+  // ── Build slash-command suggestions as user types ──────────
+  useEffect(() => {
+    const trimmed = input.trimStart();
+    if (!trimmed.startsWith('/')) {
+      setSlashSuggestions([]);
+      setSlashSelectedIdx(0);
+      return;
+    }
+
+    const query = trimmed.slice(1).toLowerCase(); // text after '/'
+    const items: { label: string; description: string; value: string }[] = [];
+
+    // Static slash commands
+    if ('tools'.startsWith(query)) {
+      items.push({ label: '/tools', description: 'List all available MCP tools', value: '/tools' });
+    }
+    if ('skills'.startsWith(query)) {
+      items.push({ label: '/skills', description: 'List all sandbox skill files', value: '/skills' });
+    }
+
+    // Individual tool suggestions: /tool:<name>
+    for (const t of availableTools) {
+      const key = `tools ${t.name}`;
+      if (key.startsWith(query) || t.name.toLowerCase().includes(query)) {
+        items.push({
+          label: `/tools ${t.name}`,
+          description: t.description,
+          value: `/tools ${t.name}`,
+        });
+      }
+    }
+
+    // Individual skill suggestions: /skills <name>
+    for (const s of availableSkills) {
+      const key = `skills ${s.name}`;
+      if (key.toLowerCase().startsWith(query) || s.name.toLowerCase().includes(query)) {
+        items.push({
+          label: `/skills ${s.name}`,
+          description: `${s.description} (${s.file})`,
+          value: `/skills ${s.name}`,
+        });
+      }
+    }
+
+    setSlashSuggestions(items.slice(0, 10));
+    setSlashSelectedIdx(0);
+  }, [input, availableTools, availableSkills]);
+
+  // ── Slash-command: /tools ──────────────────────────────────────
+  const handleToolsCommand = async () => {
+    setMessages((prev) => [...prev, { role: 'user', content: '/tools' }]);
+    setInput('');
+    setLoading(true);
+    try {
+      const res = await fetch('/api/mcp/execute');
+      const data = await res.json();
+      const tools = data.tools || [];
+      if (tools.length === 0) {
+        setMessages((prev) => [...prev, { role: 'assistant', content: 'No tools available.' }]);
+      } else {
+        const listing = tools
+          .map((t: any) => `**${t.name}** — ${t.description}\n  Parameters: ${Object.entries(t.parameters?.properties || {}).map(([k, v]: [string, any]) => `\`${k}\` (${v.type})`).join(', ') || 'none'}`)
+          .join('\n\n');
+        setMessages((prev) => [
+          ...prev,
+          { role: 'assistant', content: `### Available Tools\n\n${listing}` },
+        ]);
+      }
+    } catch {
+      setMessages((prev) => [...prev, { role: 'assistant', content: 'Failed to fetch tools.' }]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ── Slash-command: /skills ─────────────────────────────────────
+  const handleSkillsCommand = async () => {
+    setMessages((prev) => [...prev, { role: 'user', content: '/skills' }]);
+    setInput('');
+    setLoading(true);
+    try {
+      const res = await fetch('/api/skills');
+      const data = await res.json();
+      const skills = data.skills || [];
+      if (skills.length === 0) {
+        setMessages((prev) => [
+          ...prev,
+          { role: 'assistant', content: 'No skill files found in the sandbox. Create a file with "skill" in its name to register a skill.' },
+        ]);
+      } else {
+        const listing = skills
+          .map((s: any) => `**${s.name}** (file: \`${s.file}\`)\n  ${s.description}`)
+          .join('\n\n');
+        setMessages((prev) => [
+          ...prev,
+          { role: 'assistant', content: `### Available Skills\n\n${listing}` },
+        ]);
+      }
+    } catch {
+      setMessages((prev) => [...prev, { role: 'assistant', content: 'Failed to fetch skills.' }]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ── Helper: call a plan phase ──────────────────────────────────
+  const callPlanPhase = async (
+    phase: string,
+    payload: Record<string, unknown>,
+  ): Promise<any> => {
+    const res = await fetch('/api/chat/plan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    return data;
+  };
+
+  // ── Main send handler (always uses 4-phase plan pipeline) ──────
   const handleSend = async () => {
     const trimmed = input.trim();
     if (!trimmed || loading) return;
+
+    // ── Intercept pure slash commands (not plan-based) ──────────
+    if (trimmed.toLowerCase() === '/tools') {
+      return handleToolsCommand();
+    }
+    if (trimmed.toLowerCase() === '/skills') {
+      return handleSkillsCommand();
+    }
 
     const userMsg: Message = { role: 'user', content: trimmed };
     setMessages((prev) => [...prev, userMsg]);
     setInput('');
     setLoading(true);
 
+    // Reset plan state
+    const planState: PlanState = { ...INITIAL_PLAN_STATE };
+    setActivePlan({ ...planState });
+
+    // Fetch current skills for planning
+    let skillsData: { name: string; content: string }[] = [];
     try {
-      const res = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messages: [...messages, userMsg].map((m) => ({
-            role: m.role,
-            content: m.content,
-          })),
-          selectedFiles,
-        }),
+      const sr = await fetch('/api/skills');
+      const sd = await sr.json();
+      skillsData = (sd.skills || []).map((s: any) => ({ name: s.name, content: s.content }));
+    } catch { /* continue without skills */ }
+
+    // Shared payload fields
+    const basePayload = {
+      userPrompt: trimmed,
+      selectedFiles,
+      skills: skillsData,
+    };
+
+    try {
+      // ═══════════ PHASE 1: UNDERSTAND ═══════════════════════
+      planState.currentPhase = 'understand';
+      setActivePlan({ ...planState });
+
+      const p1 = await callPlanPhase('understand', { ...basePayload, phase: 'understand', messages: [] });
+      planState.understanding = p1.understanding;
+      planState.understandingRounds = p1.reviewRounds || [];
+      planState.completedPhases = ['understand'];
+
+      // ═══════════ PHASE 2: GATHER TOOLS & SKILLS ════════════
+      planState.currentPhase = 'gather';
+      setActivePlan({ ...planState });
+
+      const p2 = await callPlanPhase('gather', { ...basePayload, phase: 'gather', messages: [] });
+      planState.gathered = p2.gathered;
+      planState.gatheredRounds = p2.reviewRounds || [];
+      planState.completedPhases = ['understand', 'gather'];
+
+      // ═══════════ PHASE 3: PLAN ═════════════════════════════
+      planState.currentPhase = 'plan';
+      setActivePlan({ ...planState });
+
+      const p3 = await callPlanPhase('plan', { ...basePayload, phase: 'plan', messages: [] });
+      planState.plan = p3.plan;
+      planState.planRounds = p3.reviewRounds || [];
+      planState.completedPhases = ['understand', 'gather', 'plan'];
+
+      // ═══════════ PHASE 4: EXECUTE ══════════════════════════
+      planState.currentPhase = 'execute';
+      planState.executingStep = 0;
+      setActivePlan({ ...planState });
+
+      // Build the augmented message history for execution
+      const augmentedContent = trimmed;
+      const execMessages = [...messages, { role: 'user', content: augmentedContent }].map((m) => ({
+        role: m.role,
+        content: m.content,
+      }));
+
+      const p4 = await callPlanPhase('execute', {
+        ...basePayload,
+        phase: 'execute',
+        messages: execMessages,
+        plan: p3.plan,
       });
 
-      const data = await res.json();
+      // Mark all steps done
+      planState.executingStep = (p3.plan?.steps?.length || 1);
+      planState.completedPhases = ['understand', 'gather', 'plan', 'execute'];
+      planState.currentPhase = null;
 
-      if (data.error) {
-        setMessages((prev) => [
-          ...prev,
-          { role: 'assistant', content: `Error: ${data.error}` },
-        ]);
-      } else {
-        setMessages((prev) => [
-          ...prev,
-          {
-            role: 'assistant',
-            content: data.reply,
-            toolCalls: data.toolCalls,
-          },
-        ]);
-        // Refresh file tree in case tools created files
-        if (data.toolCalls?.length) refreshFiles();
-      }
-    } catch (err) {
+      const finalPlan = { ...planState };
+      setActivePlan(finalPlan);
+
       setMessages((prev) => [
         ...prev,
-        { role: 'assistant', content: 'Failed to reach the AI server.' },
+        {
+          role: 'assistant',
+          content: p4.reply,
+          toolCalls: p4.toolCalls,
+          planState: finalPlan,
+        },
+      ]);
+
+      if (p4.toolCalls?.length) refreshFiles();
+    } catch (err: any) {
+      planState.error = err.message || 'Plan execution failed';
+      planState.currentPhase = null;
+      setActivePlan({ ...planState });
+
+      setMessages((prev) => [
+        ...prev,
+        { role: 'assistant', content: `Error during planning: ${planState.error}` },
       ]);
     } finally {
       setLoading(false);
@@ -91,6 +288,33 @@ export function ChatInterface() {
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    // ── Slash-suggestion keyboard navigation ─────────────────
+    if (slashSuggestions.length > 0) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setSlashSelectedIdx((i) => Math.min(i + 1, slashSuggestions.length - 1));
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setSlashSelectedIdx((i) => Math.max(i - 1, 0));
+        return;
+      }
+      if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
+        e.preventDefault();
+        const selected = slashSuggestions[slashSelectedIdx];
+        if (selected) {
+          setInput(selected.value);
+          setSlashSuggestions([]);
+        }
+        return;
+      }
+      if (e.key === 'Escape') {
+        setSlashSuggestions([]);
+        return;
+      }
+    }
+
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();
@@ -232,6 +456,7 @@ export function ChatInterface() {
             {messages.map((msg, i) => (
               <div key={i}>
                 <MessageBubble role={msg.role} content={msg.content} />
+                {msg.planState && <PlanDisplay planState={msg.planState} />}
                 {msg.toolCalls?.map((tc, j) => (
                   <ToolCallDisplay key={j} toolCall={tc} />
                 ))}
@@ -239,21 +464,67 @@ export function ChatInterface() {
             ))}
 
             {loading && (
-              <div className="d-flex align-items-center gap-2 text-muted ms-2 mb-2">
-                <div className="spinner-border spinner-border-sm" />
-                <span>Thinking…</span>
-              </div>
+              <>
+                <PlanDisplay planState={activePlan} />
+                {!activePlan.currentPhase && (
+                  <div className="d-flex align-items-center gap-2 text-muted ms-2 mb-2">
+                    <div className="spinner-border spinner-border-sm" />
+                    <span>Thinking…</span>
+                  </div>
+                )}
+              </>
             )}
             <div ref={messagesEndRef} />
           </div>
 
           {/* ── Input Bar ─────────────────────────────────────── */}
-          <div className="border-top p-3 bg-white">
+          <div className="border-top p-3 bg-white" style={{ position: 'relative' }}>
+            {/* ── Slash-command suggestion dropdown ──────────── */}
+            {slashSuggestions.length > 0 && (
+              <div
+                style={{
+                  position: 'absolute',
+                  bottom: '100%',
+                  left: 12,
+                  right: 12,
+                  maxHeight: 220,
+                  overflowY: 'auto',
+                  background: '#fff',
+                  border: '1px solid #dee2e6',
+                  borderRadius: '0.375rem',
+                  boxShadow: '0 -4px 12px rgba(0,0,0,0.12)',
+                  zIndex: 10,
+                }}
+              >
+                {slashSuggestions.map((s, idx) => (
+                  <div
+                    key={s.value}
+                    style={{
+                      padding: '6px 12px',
+                      cursor: 'pointer',
+                      background: idx === slashSelectedIdx ? '#e9ecef' : 'transparent',
+                    }}
+                    onMouseEnter={() => setSlashSelectedIdx(idx)}
+                    onMouseDown={(e) => {
+                      e.preventDefault(); // keep textarea focus
+                      setInput(s.value);
+                      setSlashSuggestions([]);
+                      inputRef.current?.focus();
+                    }}
+                  >
+                    <strong style={{ color: '#0d6efd', fontSize: '0.9rem' }}>{s.label}</strong>
+                    <div style={{ fontSize: '0.78rem', color: '#6c757d' }}>{s.description}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+
             <div className="input-group">
               <textarea
+                ref={inputRef}
                 className="form-control"
                 rows={2}
-                placeholder="Type your message… (Enter to send, Shift+Enter for newline)"
+                placeholder="Type / for commands… /tools or /skills (Enter to send)"
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={handleKeyDown}

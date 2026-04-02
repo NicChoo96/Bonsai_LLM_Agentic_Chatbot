@@ -4,6 +4,7 @@ import {
   filesystemProvider,
   chromeDevToolsProvider,
   webFetchProvider,
+  systemProvider,
 } from '@/lib/mcp';
 import { buildToolSystemPrompt } from '@/lib/tool-processor';
 import { runChatWithTools } from '@/lib/tool-processor';
@@ -14,6 +15,7 @@ import type { CompletionMessage } from '@/lib/ai-client';
 registerProvider(filesystemProvider);
 registerProvider(chromeDevToolsProvider);
 registerProvider(webFetchProvider);
+registerProvider(systemProvider);
 
 export async function POST(req: NextRequest) {
   try {

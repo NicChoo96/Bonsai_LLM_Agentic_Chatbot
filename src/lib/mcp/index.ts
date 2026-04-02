@@ -2,4 +2,5 @@ export { registerProvider, getProvider, getAllProviders, getAllTools, executeToo
 export { filesystemProvider } from './filesystem';
 export { chromeDevToolsProvider } from './chrome-devtools';
 export { webFetchProvider } from './web-fetch';
+export { systemProvider } from './system';
 export type { McpProvider, McpToolDefinition, McpToolResult } from './types';
