@@ -927,6 +927,72 @@ export async function POST(req: NextRequest) {
           }
 
           sendEvent('memory', { content: memory });
+
+          // ── GOAL-COMPLETION CHECK: short-circuit remaining steps if objective is already met ──
+          const remainingSteps = finalSteps.length - (i + 1);
+          if (remainingSteps > 0 && finalStatus !== 'error') {
+            try {
+              // Gather concrete evidence from completed steps
+              const evidenceSummary = stepResults.map(r => {
+                const toolOutcomes = (r.toolCalls || [])
+                  .filter((tc: any) => tc.status === 'success')
+                  .map((tc: any) => `${tc.name}: ${(tc.result || '').slice(0, 300)}`)
+                  .join('\n  ');
+                return `Step ${r.index} (${r.description}):\n  Result: ${r.result.slice(0, 400)}${toolOutcomes ? `\n  Tool outputs:\n  ${toolOutcomes}` : ''}`;
+              }).join('\n\n');
+
+              const goalCheckSystem = [
+                'You determine whether the user\'s ORIGINAL OBJECTIVE has been FULLY achieved based on concrete evidence.',
+                '',
+                'RULES — read these carefully:',
+                '1. You must find CONCRETE PROOF that the goal was achieved: a file was opened, a command succeeded, data was returned, etc.',
+                '2. "Found a path" is NOT goal completion if the objective is to OPEN/PLAY/LAUNCH something — the open_app call must have succeeded.',
+                '3. "Listed files" is NOT goal completion if the objective requires selecting, filtering, or doing something WITH those files.',
+                '4. If the objective has MULTIPLE parts (e.g. "find X AND open Y"), ALL parts must be done.',
+                '5. When in doubt, answer "no" — false negatives are safe, false positives waste the user\'s time by skipping needed work.',
+                '6. Do NOT speculate about what "probably" happened. Only count tool calls with status=success as evidence.',
+                '',
+                'Respond with JSON ONLY:',
+                '{ "complete": true/false, "evidence": "Cite the specific tool result or data proving completion", "missing": "What still needs to happen (if not complete)" }',
+              ].join('\n');
+
+              const goalCheckUser = [
+                `ORIGINAL OBJECTIVE: "${userPrompt}"`,
+                '',
+                `COMPLETED STEPS (${stepResults.length} of ${finalSteps.length}):`,
+                evidenceSummary,
+                '',
+                `REMAINING PLANNED STEPS:`,
+                ...finalSteps.slice(i + 1).map((s: any) => `  Step ${s.index || (finalSteps.indexOf(s) + 1)}: ${s.description}`),
+              ].join('\n');
+
+              sendEvent('exchange', { phase: `goal-check-after-step-${stepIndex}`, role: 'user', label: 'Goal check', content: goalCheckUser });
+
+              const goalCheckResp = await sendChatCompletion([
+                { role: 'system', content: goalCheckSystem },
+                { role: 'user', content: goalCheckUser },
+              ]);
+              const goalCheckRaw = goalCheckResp.choices[0]?.message?.content ?? '{}';
+              sendEvent('exchange', { phase: `goal-check-after-step-${stepIndex}`, role: 'assistant', label: 'Goal check result', content: goalCheckRaw });
+
+              let goalResult: any;
+              try { goalResult = JSON.parse(goalCheckRaw); } catch { goalResult = { complete: false }; }
+
+              if (goalResult.complete === true && goalResult.evidence) {
+                sendEvent('status', { phase: 'goal_reached', message: `Goal achieved after step ${stepIndex}: ${goalResult.evidence}` });
+                sendEvent('step_complete', {
+                  index: stepIndex,
+                  result: `EARLY EXIT — Goal completed. Evidence: ${goalResult.evidence}`,
+                  toolCalls: [],
+                  status: 'goal_reached',
+                });
+                // Skip remaining steps
+                break;
+              }
+            } catch {
+              // Goal check failed — continue with remaining steps (safe default)
+            }
+          }
         }
 
         // ═══ PHASE 4: COMPILE FINAL ANSWER ═════════════════
