@@ -7,6 +7,8 @@ import { FileSelector } from './FileSelector';
 import { MarkdownEditor } from './MarkdownEditor';
 import { ToolCallDisplay } from './ToolCallDisplay';
 import { PlanDisplay, INITIAL_PLAN_STATE, type PlanState } from './PlanDisplay';
+import { ChatSessionPanel, buildExchangeGroups } from './ChatSessionPanel';
+import { SessionHistoryViewer } from './SessionHistoryViewer';
 
 interface Message {
   role: 'user' | 'assistant';
@@ -29,6 +31,9 @@ export function ChatInterface() {
   const [slashSuggestions, setSlashSuggestions] = useState<{ label: string; description: string; value: string }[]>([]);
   const [slashSelectedIdx, setSlashSelectedIdx] = useState(0);
   const [activePlan, setActivePlan] = useState<PlanState>(INITIAL_PLAN_STATE);
+  const [showSessions, setShowSessions] = useState(false);
+  const [mainTab, setMainTab] = useState<'chat' | 'history'>('chat');
+  const [historyFile, setHistoryFile] = useState<{ path: string; data: any } | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -241,7 +246,7 @@ export function ChatInterface() {
       planState.gatheredRounds = p2.reviewRounds || [];
       planState.completedPhases = ['understand', 'gather'];
 
-      // ═══════════ PHASE 3: PLAN ═════════════════════════════
+      // ═══════════ PHASE 3: PLAN + REVIEW (combined) ════════════
       planState.currentPhase = 'plan';
       setActivePlan({ ...planState });
 
@@ -249,32 +254,16 @@ export function ChatInterface() {
       if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
       planState.plan = p3.plan;
       planState.planRounds = p3.reviewRounds || [];
+      planState.review = p3.review || null;
       planState.completedPhases = ['understand', 'gather', 'plan'];
 
-      // ═══════════ PHASE 4: REVIEW (validate plan) ═══════════
-      planState.currentPhase = 'review';
-      setActivePlan({ ...planState });
-
-      const p4 = await callPlanPhase('review', {
-        ...basePayload,
-        phase: 'review',
-        messages: [],
-        plan: p3.plan,
-        understanding: p1.understanding,
-        gathered: p2.gathered,
-      }, signal);
-      if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
-      planState.review = p4.review;
-      planState.reviewValidationRounds = p4.reviewRounds || [];
-      planState.completedPhases = ['understand', 'gather', 'plan', 'review'];
-
       // If the review corrected the plan, use the corrected version
-      const finalPlanForExecution = p4.correctedPlan || p3.plan;
-      if (p4.correctedPlan) {
-        planState.plan = p4.correctedPlan;
+      const finalPlanForExecution = p3.review?.corrected_plan || p3.plan;
+      if (p3.review?.corrected_plan) {
+        planState.plan = p3.review.corrected_plan;
       }
 
-      // ═══════════ PHASE 5: EXECUTE ══════════════════════════
+      // ═══════════ PHASE 4: EXECUTE ══════════════════════════
       planState.currentPhase = 'execute';
       planState.executingStep = 0;
       setActivePlan({ ...planState });
@@ -295,7 +284,7 @@ export function ChatInterface() {
 
       // Mark all steps done
       planState.executingStep = (finalPlanForExecution?.steps?.length || 1);
-      planState.completedPhases = ['understand', 'gather', 'plan', 'review', 'execute'];
+      planState.completedPhases = ['understand', 'gather', 'plan', 'execute'];
       planState.currentPhase = null;
 
       const finalPlan = { ...planState };
@@ -381,11 +370,42 @@ export function ChatInterface() {
     setShowEditor(true);
   };
 
+  const handleSaveSession = async () => {
+    const groups = buildExchangeGroups(messages);
+    const session = {
+      version: 1,
+      savedAt: new Date().toISOString(),
+      promptCount: messages.filter((m) => m.role === 'user').length,
+      messageCount: messages.length,
+      messages,
+      exchangeGroups: groups,
+    };
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const fileName = `session-${ts}.session.json`;
+    try {
+      await fetch('/api/files', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: fileName, content: JSON.stringify(session, null, 2) }),
+      });
+      refreshFiles();
+    } catch {}
+  };
+
   const handleFileOpen = async (path: string) => {
     try {
       const res = await fetch(`/api/files/${encodeURIComponent(path)}`);
       const data = await res.json();
       if (data.content !== undefined) {
+        // Detect session history files
+        if (path.endsWith('.session.json')) {
+          try {
+            const parsed = JSON.parse(data.content);
+            setHistoryFile({ path, data: parsed });
+            setMainTab('history');
+            return;
+          } catch {}
+        }
         setEditingFile({ path, content: data.content });
         setShowEditor(true);
       }
@@ -418,6 +438,21 @@ export function ChatInterface() {
         <div className="d-flex gap-2">
           <button className="btn btn-outline-light btn-sm" onClick={handleNewFile}>
             <i className="bi bi-file-earmark-plus me-1"></i>New MD
+          </button>
+          <button
+            className={`btn btn-sm ${showSessions ? 'btn-info' : 'btn-outline-info'}`}
+            onClick={() => setShowSessions((v) => !v)}
+            title="View AI chat sessions"
+          >
+            <i className="bi bi-chat-square-text me-1"></i>Sessions
+          </button>
+          <button
+            className="btn btn-outline-success btn-sm"
+            onClick={handleSaveSession}
+            disabled={messages.length === 0}
+            title="Save session history to JSON file"
+          >
+            <i className="bi bi-save me-1"></i>Save Session
           </button>
           <button className="btn btn-outline-warning btn-sm" onClick={handleNewChat}>
             <i className="bi bi-arrow-clockwise me-1"></i>New Chat
@@ -493,6 +528,53 @@ export function ChatInterface() {
 
         {/* ── Chat Area ───────────────────────────────────────── */}
         <div className="d-flex flex-column flex-grow-1" style={{ minWidth: 0 }}>
+          {/* ── Main content tab bar ──────────────────────────── */}
+          <div className="d-flex border-bottom flex-shrink-0" style={{ background: '#f8f9fa' }}>
+            <button
+              className="btn btn-sm rounded-0 border-0 py-2 px-3"
+              style={{
+                fontSize: '0.84rem',
+                color: mainTab === 'chat' ? '#0d6efd' : '#6c757d',
+                borderBottom: mainTab === 'chat' ? '2px solid #0d6efd' : '2px solid transparent',
+                background: mainTab === 'chat' ? '#fff' : 'transparent',
+                transition: 'all 0.15s ease',
+              }}
+              onClick={() => setMainTab('chat')}
+            >
+              <i className="bi bi-chat-dots me-1"></i>Chat
+            </button>
+            {historyFile && (
+              <button
+                className="btn btn-sm rounded-0 border-0 py-2 px-3 d-flex align-items-center gap-1"
+                style={{
+                  fontSize: '0.84rem',
+                  color: mainTab === 'history' ? '#0d6efd' : '#6c757d',
+                  borderBottom: mainTab === 'history' ? '2px solid #0d6efd' : '2px solid transparent',
+                  background: mainTab === 'history' ? '#fff' : 'transparent',
+                  transition: 'all 0.15s ease',
+                }}
+                onClick={() => setMainTab('history')}
+              >
+                <i className="bi bi-clock-history me-1"></i>
+                <span className="text-truncate" style={{ maxWidth: 180 }}>
+                  {historyFile.path.split('/').pop()}
+                </span>
+                <i
+                  className="bi bi-x ms-1"
+                  style={{ fontSize: '0.72rem' }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setHistoryFile(null);
+                    setMainTab('chat');
+                  }}
+                ></i>
+              </button>
+            )}
+          </div>
+
+          {/* ── Chat tab content ──────────────────────────────── */}
+          {mainTab === 'chat' && (
+            <>
           <div className="flex-grow-1 overflow-auto p-3">
             {messages.length === 0 && (
               <div className="text-center text-muted mt-5">
@@ -589,8 +671,29 @@ export function ChatInterface() {
               </button>
             </div>
           </div>
+            </>
+          )}
+
+          {/* ── History tab content ───────────────────────────── */}
+          {mainTab === 'history' && historyFile && (
+            <SessionHistoryViewer
+              filePath={historyFile.path}
+              data={historyFile.data}
+              onClose={() => {
+                setHistoryFile(null);
+                setMainTab('chat');
+              }}
+            />
+          )}
         </div>
       </div>
+
+      {/* ── Chat Session Panel (slide-in from right) ───────────── */}
+      <ChatSessionPanel
+        groups={buildExchangeGroups(messages)}
+        open={showSessions}
+        onClose={() => setShowSessions(false)}
+      />
 
       {/* ── Markdown Editor Modal ─────────────────────────────── */}
       {showEditor && editingFile && (

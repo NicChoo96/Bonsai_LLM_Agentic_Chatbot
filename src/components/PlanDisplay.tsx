@@ -3,10 +3,11 @@
 import React, { useState } from 'react';
 
 // ─── Types ───────────────────────────────────────────────────────
-export type PlanPhase = 'understand' | 'gather' | 'plan' | 'review' | 'execute';
+export type PlanPhase = 'understand' | 'gather' | 'plan' | 'execute';
 
 export interface ReviewRound {
   round: number;
+  prompt: string;
   analysis: string;
   review_notes: string;
 }
@@ -53,7 +54,7 @@ export interface PlanState {
   } | null;
   /** Phase 3 review rounds */
   planRounds: ReviewRound[];
-  /** Phase 4 output: plan validation */
+  /** Plan validation (embedded in plan phase) */
   review: {
     verdict: 'pass' | 'fail' | 'needs_correction';
     issues: string[];
@@ -61,8 +62,6 @@ export interface PlanState {
     reasoning: string;
     confidence: number;
   } | null;
-  /** Phase 4 review rounds */
-  reviewValidationRounds: ReviewRound[];
   /** Phase 5: which plan step index is executing */
   executingStep: number;
   /** Whether the user aborted the pipeline */
@@ -81,7 +80,6 @@ export const INITIAL_PLAN_STATE: PlanState = {
   plan: null,
   planRounds: [],
   review: null,
-  reviewValidationRounds: [],
   executingStep: -1,
   aborted: false,
   error: null,
@@ -91,8 +89,7 @@ export const INITIAL_PLAN_STATE: PlanState = {
 const PHASES: { id: PlanPhase; label: string; icon: string; description: string }[] = [
   { id: 'understand', label: 'Understanding', icon: 'bi-chat-left-text', description: 'Analyzing your request…' },
   { id: 'gather', label: 'Gathering', icon: 'bi-collection', description: 'Collecting tools & skills…' },
-  { id: 'plan', label: 'Planning', icon: 'bi-list-check', description: 'Building execution plan…' },
-  { id: 'review', label: 'Reviewing', icon: 'bi-shield-check', description: 'Validating plan against your request…' },
+  { id: 'plan', label: 'Plan & Review', icon: 'bi-list-check', description: 'Building & validating plan…' },
   { id: 'execute', label: 'Executing', icon: 'bi-play-circle', description: 'Running the plan…' },
 ];
 
@@ -107,6 +104,8 @@ function ReviewRoundsPanel({ rounds, label }: { rounds: ReviewRound[]; label: st
   const [expanded, setExpanded] = useState(false);
 
   if (!rounds || rounds.length === 0) return null;
+
+  const latestRound = rounds[rounds.length - 1]?.round ?? 1;
 
   return (
     <div className="ms-2 mt-2">
@@ -127,62 +126,114 @@ function ReviewRoundsPanel({ rounds, label }: { rounds: ReviewRound[]; label: st
             let parsed: any = null;
             try { parsed = JSON.parse(r.analysis); } catch { /* raw text */ }
 
+            const isCurrent = r.round === latestRound;
+            const isInitial = r.round === 1;
+
             return (
               <div
                 key={r.round}
-                className="mb-2 p-2 rounded"
-                style={{ background: '#f8f9fa', fontSize: '0.78rem' }}
+                className="mb-3 rounded"
+                style={{
+                  background: isCurrent ? '#e7f1ff' : '#f8f9fa',
+                  border: isCurrent ? '1px solid #b6d4fe' : '1px solid #e9ecef',
+                  fontSize: '0.78rem',
+                }}
               >
-                <div className="d-flex align-items-center gap-2 mb-1">
+                {/* Round header */}
+                <div
+                  className="d-flex align-items-center gap-2 px-2 py-1"
+                  style={{
+                    borderBottom: '1px solid #e9ecef',
+                    background: isCurrent ? '#cfe2ff' : '#eee',
+                    borderRadius: '0.25rem 0.25rem 0 0',
+                  }}
+                >
                   <span
                     className="badge rounded-pill"
                     style={{
                       fontSize: '0.68rem',
-                      background: r.round === 1 ? '#0d6efd' : '#6c757d',
+                      background: isCurrent ? '#0d6efd' : '#6c757d',
                       color: '#fff',
                     }}
                   >
                     Round {r.round}
                   </span>
-                  <small className="text-muted fst-italic">{r.review_notes}</small>
+                  <small className="text-muted fst-italic flex-grow-1">{r.review_notes}</small>
+                  {isCurrent && (
+                    <span className="badge bg-primary" style={{ fontSize: '0.64rem' }}>Latest</span>
+                  )}
                 </div>
 
-                {parsed ? (
-                  <details>
-                    <summary style={{ cursor: 'pointer', fontSize: '0.76rem' }} className="text-secondary">
-                      View full output
-                    </summary>
-                    <pre
-                      className="mb-0 mt-1 p-2 rounded"
-                      style={{
-                        fontSize: '0.72rem',
-                        background: '#fff',
-                        border: '1px solid #e9ecef',
-                        maxHeight: 200,
-                        overflow: 'auto',
-                        whiteSpace: 'pre-wrap',
-                        wordBreak: 'break-word',
-                      }}
+                <div className="p-2">
+                  {/* ── Prompt to AI ─────────────────────────── */}
+                  {r.prompt && (
+                    <details className="mb-2">
+                      <summary
+                        style={{ cursor: 'pointer', fontSize: '0.76rem' }}
+                        className="text-secondary d-flex align-items-center gap-1"
+                      >
+                        <i className="bi bi-arrow-right-circle text-warning"></i>
+                        <span>{isInitial ? 'Prompt to AI' : 'Review prompt to AI'}</span>
+                      </summary>
+                      <pre
+                        className="mb-0 mt-1 p-2 rounded"
+                        style={{
+                          fontSize: '0.72rem',
+                          background: '#fff8e1',
+                          border: '1px solid #ffe082',
+                          maxHeight: 200,
+                          overflow: 'auto',
+                          whiteSpace: 'pre-wrap',
+                          wordBreak: 'break-word',
+                        }}
+                      >
+                        {r.prompt}
+                      </pre>
+                    </details>
+                  )}
+
+                  {/* ── Response from AI ─────────────────────── */}
+                  <details open={isCurrent}>
+                    <summary
+                      style={{ cursor: 'pointer', fontSize: '0.76rem' }}
+                      className="text-secondary d-flex align-items-center gap-1"
                     >
-                      {JSON.stringify(parsed, null, 2)}
-                    </pre>
+                      <i className="bi bi-arrow-left-circle text-success"></i>
+                      <span>AI response</span>
+                    </summary>
+                    {parsed ? (
+                      <pre
+                        className="mb-0 mt-1 p-2 rounded"
+                        style={{
+                          fontSize: '0.72rem',
+                          background: '#fff',
+                          border: '1px solid #e9ecef',
+                          maxHeight: 250,
+                          overflow: 'auto',
+                          whiteSpace: 'pre-wrap',
+                          wordBreak: 'break-word',
+                        }}
+                      >
+                        {JSON.stringify(parsed, null, 2)}
+                      </pre>
+                    ) : (
+                      <pre
+                        className="mb-0 mt-1 p-2 rounded"
+                        style={{
+                          fontSize: '0.72rem',
+                          background: '#fff',
+                          border: '1px solid #e9ecef',
+                          maxHeight: 250,
+                          overflow: 'auto',
+                          whiteSpace: 'pre-wrap',
+                          wordBreak: 'break-word',
+                        }}
+                      >
+                        {r.analysis}
+                      </pre>
+                    )}
                   </details>
-                ) : (
-                  <pre
-                    className="mb-0 p-2 rounded"
-                    style={{
-                      fontSize: '0.72rem',
-                      background: '#fff',
-                      border: '1px solid #e9ecef',
-                      maxHeight: 200,
-                      overflow: 'auto',
-                      whiteSpace: 'pre-wrap',
-                      wordBreak: 'break-word',
-                    }}
-                  >
-                    {r.analysis}
-                  </pre>
-                )}
+                </div>
               </div>
             );
           })}
@@ -194,7 +245,7 @@ function ReviewRoundsPanel({ rounds, label }: { rounds: ReviewRound[]; label: st
 
 export function PlanDisplay({ planState, onAbort }: PlanDisplayProps) {
   const { currentPhase, completedPhases, understanding, gathered, plan, executingStep, error, aborted,
-          understandingRounds, gatheredRounds, planRounds, review, reviewValidationRounds } = planState;
+          understandingRounds, gatheredRounds, planRounds, review } = planState;
 
   if (!currentPhase && completedPhases.length === 0) return null;
 
@@ -394,69 +445,51 @@ export function PlanDisplay({ planState, onAbort }: PlanDisplayProps) {
               })}
             </div>
 
-            <ReviewRoundsPanel rounds={planRounds} label="Planning thinking" />
-          </div>
-        )}
+            <ReviewRoundsPanel rounds={planRounds} label="Plan & review thinking" />
 
-        {/* ── Phase 4 output: Review / Validation ─────────────── */}
-        {review && (
-          <div className="p-3 border-bottom">
-            <div className="d-flex align-items-center gap-2 mb-2">
-              <i className="bi bi-shield-check text-primary"></i>
-              <strong className="text-primary">Plan Review</strong>
-              <small className="text-muted ms-auto" style={{ fontSize: '0.72rem' }}>
-                <i className="bi bi-arrow-repeat me-1"></i>{reviewValidationRounds.length || 3} review rounds
-              </small>
-            </div>
-
-            {/* Verdict badge */}
-            <div className="d-flex align-items-center gap-2 mb-2">
-              <span
-                className={`badge ${
-                  review.verdict === 'pass' ? 'bg-success' :
-                  review.verdict === 'needs_correction' ? 'bg-warning text-dark' :
-                  'bg-danger'
-                }`}
-                style={{ fontSize: '0.82rem' }}
-              >
-                {review.verdict === 'pass' && <><i className="bi bi-check-circle me-1"></i>Plan Validated</>}
-                {review.verdict === 'needs_correction' && <><i className="bi bi-pencil-square me-1"></i>Corrected</>}
-                {review.verdict === 'fail' && <><i className="bi bi-x-circle me-1"></i>Failed Validation</>}
-              </span>
-              {review.confidence != null && (
-                <span className="badge bg-outline-secondary text-secondary" style={{ fontSize: '0.76rem', border: '1px solid #6c757d' }}>
-                  Confidence: {review.confidence}%
-                </span>
-              )}
-            </div>
-
-            {/* Reasoning */}
-            <p className="mb-1 text-muted" style={{ fontSize: '0.82rem' }}>{review.reasoning}</p>
-
-            {/* Issues list */}
-            {review.issues && review.issues.length > 0 && (
-              <div className="ms-2 mb-2">
-                <small className="text-muted fw-semibold">
-                  <i className="bi bi-exclamation-triangle me-1 text-warning"></i>Issues Found:
-                </small>
-                <ul className="mb-0 ps-3" style={{ fontSize: '0.84rem' }}>
-                  {review.issues.map((issue, i) => (
-                    <li key={i} className="text-danger-emphasis">{issue}</li>
-                  ))}
-                </ul>
+            {/* ── Inline review verdict (from combined plan+review) ── */}
+            {review && (
+              <div className="mt-2 pt-2" style={{ borderTop: '1px dashed #dee2e6' }}>
+                <div className="d-flex align-items-center gap-2 mb-2">
+                  <i className="bi bi-shield-check text-primary" style={{ fontSize: '0.9rem' }}></i>
+                  <small className="fw-semibold text-primary">Validation</small>
+                  <span
+                    className={`badge ${
+                      review.verdict === 'pass' ? 'bg-success' :
+                      review.verdict === 'needs_correction' ? 'bg-warning text-dark' :
+                      'bg-danger'
+                    }`}
+                    style={{ fontSize: '0.76rem' }}
+                  >
+                    {review.verdict === 'pass' && <><i className="bi bi-check-circle me-1"></i>Validated</>}
+                    {review.verdict === 'needs_correction' && <><i className="bi bi-pencil-square me-1"></i>Corrected</>}
+                    {review.verdict === 'fail' && <><i className="bi bi-x-circle me-1"></i>Failed</>}
+                  </span>
+                  {review.confidence != null && (
+                    <span className="badge bg-outline-secondary text-secondary" style={{ fontSize: '0.72rem', border: '1px solid #6c757d' }}>
+                      {review.confidence}%
+                    </span>
+                  )}
+                </div>
+                {review.reasoning && (
+                  <p className="mb-1 text-muted" style={{ fontSize: '0.8rem' }}>{review.reasoning}</p>
+                )}
+                {review.issues && review.issues.length > 0 && (
+                  <div className="ms-2 mb-1">
+                    <ul className="mb-0 ps-3" style={{ fontSize: '0.8rem' }}>
+                      {review.issues.map((issue, i) => (
+                        <li key={i} className="text-danger-emphasis">{issue}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {review.corrected_plan && (
+                  <small className="text-success fw-semibold ms-2">
+                    <i className="bi bi-arrow-clockwise me-1"></i>Plan was corrected before execution.
+                  </small>
+                )}
               </div>
             )}
-
-            {/* Corrected plan indicator */}
-            {review.corrected_plan && (
-              <div className="ms-2">
-                <small className="text-success fw-semibold">
-                  <i className="bi bi-arrow-clockwise me-1"></i>Plan was automatically corrected before execution.
-                </small>
-              </div>
-            )}
-
-            <ReviewRoundsPanel rounds={reviewValidationRounds} label="Validation thinking" />
           </div>
         )}
 

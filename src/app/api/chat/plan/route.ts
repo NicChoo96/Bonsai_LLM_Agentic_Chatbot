@@ -20,9 +20,8 @@ registerProvider(systemProvider);
 // ─── Phase types ─────────────────────────────────────────────────
 // Phase 1: understand  – parse user prompt, return understanding
 // Phase 2: gather      – collect tools + skills relevant to the task
-// Phase 3: plan        – produce a numbered step-by-step plan
-// Phase 4: review      – validate the plan against the original prompt
-// Phase 5: execute     – run the plan steps sequentially
+// Phase 3: plan        – produce a plan AND validate/review it in one stage
+// Phase 4: execute     – run the plan steps with error-recovery retries
 
 export async function POST(req: NextRequest) {
   try {
@@ -37,7 +36,7 @@ export async function POST(req: NextRequest) {
       understanding,
       gathered,
     } = body as {
-      phase: 'understand' | 'gather' | 'plan' | 'review' | 'execute';
+      phase: 'understand' | 'gather' | 'plan' | 'execute';
       userPrompt: string;
       messages: { role: string; content: string }[];
       selectedFiles: string[];
@@ -68,7 +67,7 @@ export async function POST(req: NextRequest) {
     }
 
     // ════════════════════════════════════════════════════════════
-    // PHASE 1: UNDERSTAND  (with 4 self-review rounds)
+    // PHASE 1: UNDERSTAND  (with 1 self-review round = 2 total)
     // ════════════════════════════════════════════════════════════
     if (phase === 'understand') {
       // ── Collect tool & skill summaries for the model to reason about ──
@@ -122,14 +121,14 @@ export async function POST(req: NextRequest) {
       const r1Raw = r1.choices[0]?.message?.content ?? '{}';
 
       // Capture round-by-round thinking
-      const reviewRounds: { round: number; analysis: string; review_notes: string }[] = [];
+      const reviewRounds: { round: number; prompt: string; analysis: string; review_notes: string }[] = [];
 
       // Record round 1
       let r1Parsed: any;
       try { r1Parsed = JSON.parse(r1Raw); } catch { r1Parsed = { summary: r1Raw }; }
-      reviewRounds.push({ round: 1, analysis: r1Raw, review_notes: 'Initial analysis' });
+      reviewRounds.push({ round: 1, prompt: userPrompt, analysis: r1Raw, review_notes: 'Initial analysis' });
 
-      // ── Rounds 2-4: Self-review loop ───────────────────────
+      // ── Round 2: Self-review ────────────────────────────────
       const reviewSystemContent = [
         'You are an AI self-review assistant. You are reviewing your OWN previous analysis of a user request.',
         'Critique and IMPROVE:',
@@ -145,7 +144,8 @@ export async function POST(req: NextRequest) {
 
       let latestAnalysis = r1Raw;
 
-      for (let round = 2; round <= 4; round++) {
+      {
+        const round = 2;
         const reviewMessages: CompletionMessage[] = [
           { role: 'system', content: reviewSystemContent },
           {
@@ -153,13 +153,14 @@ export async function POST(req: NextRequest) {
             content: [
               `Original user request: "${userPrompt}"`,
               '',
-              `Previous analysis (round ${round - 1}):\n${latestAnalysis}`,
+              `Previous analysis (round 1):\n${latestAnalysis}`,
               '',
-              `This is review round ${round} of 4. Carefully review and improve the analysis above.`,
+              `This is the final review round. Carefully review and improve the analysis above.`,
             ].join('\n'),
           },
         ];
 
+        const reviewUserContent = reviewMessages[1].content;
         const rN = await sendChatCompletion(reviewMessages);
         const rNRaw = rN.choices[0]?.message?.content ?? latestAnalysis;
         latestAnalysis = rNRaw;
@@ -169,6 +170,7 @@ export async function POST(req: NextRequest) {
         try { rNParsed = JSON.parse(rNRaw); } catch { rNParsed = { summary: rNRaw }; }
         reviewRounds.push({
           round,
+          prompt: reviewUserContent,
           analysis: rNRaw,
           review_notes: rNParsed.review_notes || `Review round ${round}`,
         });
@@ -246,10 +248,10 @@ export async function POST(req: NextRequest) {
       const raw = response.choices[0]?.message?.content ?? '{}';
 
       // Capture round-by-round thinking
-      const gatherRounds: { round: number; analysis: string; review_notes: string }[] = [];
-      gatherRounds.push({ round: 1, analysis: raw, review_notes: 'Initial tool/skill selection' });
+      const gatherRounds: { round: number; prompt: string; analysis: string; review_notes: string }[] = [];
+      gatherRounds.push({ round: 1, prompt: userPrompt, analysis: raw, review_notes: 'Initial tool/skill selection' });
 
-      // ── Rounds 2-3: Self-review of tool selection ──────────
+      // ── Round 2: Self-review of tool selection ───────────
       const gatherReviewSystem = [
         'You are an AI self-review assistant reviewing your OWN tool/skill selection.',
         'Critique: any tools unnecessary? Any critical tools MISSING? Skill selection appropriate?',
@@ -260,7 +262,8 @@ export async function POST(req: NextRequest) {
       ].join('\n');
 
       let latestGather = raw;
-      for (let round = 2; round <= 3; round++) {
+      {
+        const round = 2;
         const reviewMessages: CompletionMessage[] = [
           { role: 'system', content: gatherReviewSystem },
           {
@@ -268,12 +271,13 @@ export async function POST(req: NextRequest) {
             content: [
               `Original user request: "${userPrompt}"`,
               '',
-              `Previous selection (round ${round - 1}):\n${latestGather}`,
+              `Previous selection (round 1):\n${latestGather}`,
               '',
-              `This is review round ${round} of 3. Review and improve.`,
+              `This is the final review round. Review and improve.`,
             ].join('\n'),
           },
         ];
+        const gatherUserContent = reviewMessages[1].content;
         const rN = await sendChatCompletion(reviewMessages);
         const rNRaw = rN.choices[0]?.message?.content ?? latestGather;
         latestGather = rNRaw;
@@ -282,6 +286,7 @@ export async function POST(req: NextRequest) {
         try { rNParsed = JSON.parse(rNRaw); } catch { rNParsed = {}; }
         gatherRounds.push({
           round,
+          prompt: gatherUserContent,
           analysis: rNRaw,
           review_notes: rNParsed.review_notes || `Review round ${round}`,
         });
@@ -309,7 +314,7 @@ export async function POST(req: NextRequest) {
     }
 
     // ════════════════════════════════════════════════════════════
-    // PHASE 3: PLAN
+    // PHASE 3: PLAN + REVIEW (combined — 2 rounds total)
     // ════════════════════════════════════════════════════════════
     if (phase === 'plan') {
       const allTools = getAllTools();
@@ -320,8 +325,10 @@ export async function POST(req: NextRequest) {
         return `- ${t.name}: ${t.description} [params: ${params}]`;
       }).join('\n');
 
+      const toolNames = allTools.map((t) => t.name).join(', ');
       const skillDocs = (skills || []).map((s) => `- ${s.name}: ${s.content.slice(0, 200)}`).join('\n');
 
+      // ── Round 1: Create plan ───────────────────────────────
       const systemContent = [
         'You are an AI planning assistant. Create a DETAILED step-by-step execution plan.',
         'Each step must be a concrete, actionable instruction that specifies which tool to use and with what arguments.',
@@ -349,28 +356,29 @@ export async function POST(req: NextRequest) {
       const response = await sendChatCompletion(completionMessages);
       const raw = response.choices[0]?.message?.content ?? '{}';
 
-      // Capture round-by-round thinking
-      const planRounds: { round: number; analysis: string; review_notes: string }[] = [];
-      planRounds.push({ round: 1, analysis: raw, review_notes: 'Initial plan' });
+      const planRounds: { round: number; prompt: string; analysis: string; review_notes: string }[] = [];
+      planRounds.push({ round: 1, prompt: userPrompt, analysis: raw, review_notes: 'Initial plan' });
 
-      // ── Rounds 2-3: Self-review of plan ────────────────────
+      // ── Round 2: Review + validate + correct the plan ──────
       const planReviewSystem = [
-        'You are an AI self-review assistant reviewing your OWN execution plan.',
-        'Critique:',
-        '  - Steps in right order? Dependencies correct?',
-        '  - Any steps missing or redundant?',
-        '  - Tool choices optimal? Predicted arguments correct?',
-        '  - Each step concrete and actionable?',
+        'You are an AI assistant that REVIEWS and VALIDATES an execution plan.',
+        'You must do TWO things in one pass:',
+        '  1. IMPROVE the plan: fix ordering, dependencies, missing/redundant steps, tool choices, argument accuracy.',
+        '  2. VALIDATE the plan: verify it fully addresses the user\'s original request end-to-end.',
         '',
-        'Produce an IMPROVED version as JSON:',
-        '  "steps": array of { step, action, tool, args, depends_on }',
-        '  "summary": one-line summary',
-        '  "review_notes": what changed',
-        'Respond ONLY with valid JSON.',
-      ].filter(Boolean).join('\n');
+        'Respond ONLY with valid JSON:',
+        '  "steps": the improved/corrected array of { step, action, tool, args, depends_on }',
+        '  "summary": one-line summary of the plan',
+        '  "review_notes": what was changed or validated',
+        '  "verdict": "pass" | "needs_correction" (whether the plan needed corrections)',
+        '  "issues": array of issues found (empty if none)',
+        '  "confidence": 0-100 confidence that this plan will succeed',
+        '',
+        `Available tool names: ${toolNames}`,
+      ].join('\n');
 
       let latestPlan = raw;
-      for (let round = 2; round <= 3; round++) {
+      {
         const reviewMessages: CompletionMessage[] = [
           { role: 'system', content: planReviewSystem },
           {
@@ -378,12 +386,13 @@ export async function POST(req: NextRequest) {
             content: [
               `Original user request: "${userPrompt}"`,
               '',
-              `Previous plan (round ${round - 1}):\n${latestPlan}`,
+              `Plan to review and improve:\n${latestPlan}`,
               '',
-              `This is review round ${round} of 3. Review and improve.`,
+              'Review, validate, and improve this plan. Fix any issues.',
             ].join('\n'),
           },
         ];
+        const planUserContent = reviewMessages[1].content;
         const rN = await sendChatCompletion(reviewMessages);
         const rNRaw = rN.choices[0]?.message?.content ?? latestPlan;
         latestPlan = rNRaw;
@@ -391,158 +400,49 @@ export async function POST(req: NextRequest) {
         let rNParsed: any;
         try { rNParsed = JSON.parse(rNRaw); } catch { rNParsed = {}; }
         planRounds.push({
-          round,
+          round: 2,
+          prompt: planUserContent,
           analysis: rNRaw,
-          review_notes: rNParsed.review_notes || `Review round ${round}`,
+          review_notes: rNParsed.review_notes || 'Plan review & validation',
         });
       }
 
-      let planData;
+      // Parse final plan (which includes review data)
+      let planData: any;
       try {
         planData = JSON.parse(latestPlan);
       } catch {
         planData = {
           steps: [{ step: 1, action: latestPlan, tool: 'none', args: null, depends_on: [] }],
           summary: 'Could not parse structured plan',
-        };
-      }
-      const { review_notes: _prn, ...publicPlan } = planData;
-
-      return NextResponse.json({ phase: 'plan', plan: publicPlan, reviewRounds: planRounds });
-    }
-
-    // ════════════════════════════════════════════════════════════
-    // PHASE 4: REVIEW (validate plan against original prompt)
-    // ════════════════════════════════════════════════════════════
-    if (phase === 'review') {
-      const allTools = getAllTools();
-      const toolDocs = allTools.map((t) => {
-        const params = Object.entries(t.parameters.properties)
-          .map(([k, v]) => `${k}: ${v.description}`)
-          .join(', ');
-        return `- ${t.name}: ${t.description} [params: ${params}]`;
-      }).join('\n');
-
-      // Build compact tool reference (names only) for validation
-      const toolNames = allTools.map((t) => t.name).join(', ');
-
-      // ── Round 1: Cross-check plan vs prompt ────────────────
-      const reviewSystemContent = [
-        'You are an AI validation assistant. Verify the execution plan is CORRECT and COMPLETE.',
-        '',
-        'Validate:',
-        '  - Each step serves the user\'s original intent',
-        '  - No steps contradict, are missing, or are redundant',
-        '  - Tool choices correct (only use tools from the available list)',
-        '  - Arguments correct (param names, types, values)',
-        '  - Step ordering and dependencies correct',
-        '  - Plan achieves what user wants end-to-end',
-        '',
-        'Respond ONLY with valid JSON:',
-        '  "verdict": "pass" | "fail" | "needs_correction"',
-        '  "issues": array of issue strings (empty if pass)',
-        '  "corrected_plan": corrected plan object if "needs_correction", else null',
-        '  "reasoning": validation analysis',
-        '  "confidence": 0-100',
-        '  "review_notes": what you checked',
-        '',
-        `Available tool names: ${toolNames}`,
-      ].join('\n');
-
-      const reviewMessages: CompletionMessage[] = [
-        { role: 'system', content: reviewSystemContent },
-        {
-          role: 'user',
-          content: [
-            `USER PROMPT: ${userPrompt}`,
-            '',
-            `UNDERSTANDING: ${JSON.stringify(understanding || {})}`,
-            '',
-            `GATHERED: ${JSON.stringify(gathered || {})}`,
-            '',
-            `PLAN: ${JSON.stringify(plan || {})}`,
-            '',
-            'Validate this plan against the original prompt.',
-          ].join('\n'),
-        },
-      ];
-
-      const r1 = await sendChatCompletion(reviewMessages);
-      const r1Raw = r1.choices[0]?.message?.content ?? '{}';
-
-      const reviewRounds: { round: number; analysis: string; review_notes: string }[] = [];
-      let r1Parsed: any;
-      try { r1Parsed = JSON.parse(r1Raw); } catch { r1Parsed = { verdict: 'pass', reasoning: r1Raw }; }
-      reviewRounds.push({ round: 1, analysis: r1Raw, review_notes: r1Parsed.review_notes || 'Initial validation' });
-
-      // ── Rounds 2-3: Self-review the review itself ──────────
-      const metaReviewSystem = [
-        'You are an AI meta-reviewer reviewing your OWN validation of an execution plan.',
-        'Was the previous validation thorough? Did it miss issues?',
-        'Re-read the original prompt word by word, re-check every step, confirm the verdict.',
-        '',
-        'Respond ONLY with valid JSON:',
-        '  "verdict", "issues", "corrected_plan", "reasoning", "confidence", "review_notes"',
-      ].join('\n');
-
-      let latestReview = r1Raw;
-      for (let round = 2; round <= 3; round++) {
-        const roundMessages: CompletionMessage[] = [
-          { role: 'system', content: metaReviewSystem },
-          {
-            role: 'user',
-            content: [
-              `Original user prompt: "${userPrompt}"`,
-              '',
-              `Plan: ${JSON.stringify(plan || {})}`,
-              '',
-              `Previous validation (round ${round - 1}):\n${latestReview}`,
-              '',
-              `Meta-review round ${round} of 3. Be thorough.`,
-            ].join('\n'),
-          },
-        ];
-
-        const rN = await sendChatCompletion(roundMessages);
-        const rNRaw = rN.choices[0]?.message?.content ?? latestReview;
-        latestReview = rNRaw;
-
-        let rNParsed: any;
-        try { rNParsed = JSON.parse(rNRaw); } catch { rNParsed = {}; }
-        reviewRounds.push({
-          round,
-          analysis: rNRaw,
-          review_notes: rNParsed.review_notes || `Meta-review round ${round}`,
-        });
-      }
-
-      // Parse final review
-      let finalReview: any;
-      try {
-        finalReview = JSON.parse(latestReview);
-      } catch {
-        finalReview = {
           verdict: 'pass',
           issues: [],
-          corrected_plan: null,
-          reasoning: latestReview,
           confidence: 50,
         };
       }
 
-      const { review_notes: _rrn, ...publicReview } = finalReview;
+      // Extract review info from the combined output
+      const review = {
+        verdict: planData.verdict || 'pass',
+        issues: planData.issues || [],
+        corrected_plan: planData.verdict === 'needs_correction' ? { steps: planData.steps, summary: planData.summary } : null,
+        reasoning: planData.review_notes || '',
+        confidence: planData.confidence ?? 75,
+      };
+
+      // Clean up plan data (remove review-only fields)
+      const { review_notes: _prn, verdict: _v, issues: _iss, confidence: _conf, ...publicPlan } = planData;
 
       return NextResponse.json({
-        phase: 'review',
-        review: publicReview,
-        // If review corrected the plan, return corrected version
-        correctedPlan: finalReview.corrected_plan || null,
-        reviewRounds,
+        phase: 'plan',
+        plan: publicPlan,
+        review,
+        reviewRounds: planRounds,
       });
     }
 
     // ════════════════════════════════════════════════════════════
-    // PHASE 5: EXECUTE
+    // PHASE 4: EXECUTE (with error-recovery retries)
     // ════════════════════════════════════════════════════════════
     if (phase === 'execute') {
       // Build selective tool docs: only include tools referenced in the plan

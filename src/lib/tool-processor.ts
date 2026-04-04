@@ -3,7 +3,8 @@ import { sendChatCompletion, type CompletionMessage } from './ai-client';
 import type { ToolCall } from '@/types';
 
 // ─── Constants ───────────────────────────────────────────────────
-const MAX_TOOL_ITERATIONS = 12;
+const MAX_TOOL_ITERATIONS = 15;
+const MAX_CONSECUTIVE_ERRORS = 3;
 const TOOL_CALL_REGEX = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
 
 // Tools whose results should trigger the verification loop
@@ -120,6 +121,43 @@ export function stripToolCallBlocks(content: string): string {
   return content.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '').trim();
 }
 
+// ─── Build error-recovery prompt for failed tool calls ──────────
+function buildErrorRecoveryPrompt(executed: ToolCall[]): string {
+  const errors = executed.filter((tc) => tc.status === 'error');
+  if (errors.length === 0) return '';
+
+  const errorDetails = errors
+    .map(
+      (tc) =>
+        `- Tool "${tc.name}" with args ${JSON.stringify(tc.arguments)} FAILED:\n  ${tc.result}`,
+    )
+    .join('\n');
+
+  return [
+    '',
+    '═══ TOOL ERROR — RECOVERY REQUIRED ═══',
+    'One or more tool calls failed. You MUST NOT give up or stop.',
+    '',
+    'Failed calls:',
+    errorDetails,
+    '',
+    'RECOVERY STEPS — follow these in order:',
+    '1. ANALYZE: Why did the tool fail? Wrong name, wrong args, missing file, wrong path?',
+    '2. REASON: What alternative tool or approach can achieve the same goal?',
+    '3. ACT: Make a new tool call using a corrected approach.',
+    '',
+    'Common recovery strategies:',
+    '- Wrong tool name → check available tools list and use the correct one',
+    '- Wrong path → use sandbox_list_files to discover the correct path first',
+    '- Missing file → create it, or check if a differently-named file exists',
+    '- Permission/capability error → try an alternative tool that achieves the same thing',
+    '- Malformed args → re-read the tool parameter docs and fix the arguments',
+    '',
+    'Do NOT apologize or explain failure to the user. Just try again with a better approach.',
+    '═══════════════════════════════════════',
+  ].join('\n');
+}
+
 // ─── Build verification prompt for tool results ─────────────────
 function buildVerificationPrompt(executed: ToolCall[]): string {
   const checks: string[] = [];
@@ -180,6 +218,7 @@ export async function runChatWithTools(
   messages: CompletionMessage[],
 ): Promise<{ reply: string; toolCalls: ToolCall[] }> {
   const allToolCalls: ToolCall[] = [];
+  let consecutiveErrors = 0;
 
   for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
     const response = await sendChatCompletion(messages);
@@ -196,6 +235,36 @@ export async function runChatWithTools(
     const executed = await processToolCalls(parsed);
     allToolCalls.push(...executed);
 
+    // Check if any calls errored
+    const hasErrors = executed.some((tc) => tc.status === 'error');
+    const allErrors = executed.every((tc) => tc.status === 'error');
+
+    if (allErrors) {
+      consecutiveErrors++;
+    } else {
+      consecutiveErrors = 0;
+    }
+
+    // If we've had too many consecutive all-error rounds, force a rethink
+    if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+      messages.push({ role: 'assistant', content: assistantContent });
+      messages.push({
+        role: 'user',
+        content: [
+          `Tool results:\n\n${executed.map((tc) => `[Tool Result: ${tc.name}] (status: ${tc.status})\n${tc.result}`).join('\n\n')}`,
+          '',
+          '═══ CRITICAL: REPEATED FAILURES ═══',
+          `You have failed ${MAX_CONSECUTIVE_ERRORS} times in a row. STOP using the same approach.`,
+          'Take a completely different strategy. If the current tool doesn\'t work, try a different tool entirely.',
+          'If no tool can accomplish this specific sub-task, skip it and move on to the next step in the plan.',
+          'Explain what you accomplished so far and what could not be done.',
+          '═══════════════════════════════════',
+        ].join('\n'),
+      });
+      consecutiveErrors = 0;
+      continue;
+    }
+
     // Feed assistant response + tool results back into the conversation
     messages.push({ role: 'assistant', content: assistantContent });
 
@@ -209,9 +278,12 @@ export async function runChatWithTools(
     // Build verification prompt for verifiable tools
     const verificationPrompt = buildVerificationPrompt(executed);
 
+    // Build error recovery prompt if any tools failed
+    const errorRecoveryPrompt = hasErrors ? buildErrorRecoveryPrompt(executed) : '';
+
     messages.push({
       role: 'user',
-      content: `Tool results:\n\n${toolResultContent}${verificationPrompt}`,
+      content: `Tool results:\n\n${toolResultContent}${verificationPrompt}${errorRecoveryPrompt}`,
     });
   }
 
