@@ -1,1 +1,0 @@
-Do not use CDP. Use http_get tool to read information from the site given in the prompt and convert the data from return data into a proper array text in JSON format.

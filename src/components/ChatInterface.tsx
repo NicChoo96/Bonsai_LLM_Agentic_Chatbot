@@ -10,6 +10,11 @@ import { PlanDisplay, INITIAL_PLAN_STATE, type PlanState } from './PlanDisplay';
 import { ChatSessionPanel, buildExchangeGroups, type Exchange, type ExchangeGroup } from './ChatSessionPanel';
 import { SessionHistoryViewer } from './SessionHistoryViewer';
 import { SubAgentDisplay, buildHandoff, MAX_SUB_AGENT_RETRIES, type SubAgentRun } from './SubAgentDisplay';
+import { TerminalDisplay, type TerminalStep } from './TerminalDisplay';
+import { ContinuousDisplay, type ContinuousIteration } from './ContinuousDisplay';
+
+type ChatMode = 'plan' | 'continuous';
+const MAX_CONTINUOUS_ITERATIONS = 15;
 
 interface Message {
   role: 'user' | 'assistant';
@@ -17,6 +22,8 @@ interface Message {
   toolCalls?: any[];
   planState?: PlanState;
   subAgentRuns?: SubAgentRun[];
+  continuousIterations?: ContinuousIteration[];
+  continuousMemory?: string;
 }
 
 export function ChatInterface() {
@@ -38,6 +45,10 @@ export function ChatInterface() {
   const [historyFile, setHistoryFile] = useState<{ path: string; data: any } | null>(null);
   const [subAgentRuns, setSubAgentRuns] = useState<SubAgentRun[]>([]);
   const [liveExchanges, setLiveExchanges] = useState<Exchange[]>([]);
+  const [chatMode, setChatMode] = useState<ChatMode>('plan');
+  const [continuousIterations, setContinuousIterations] = useState<ContinuousIteration[]>([]);
+  const [continuousMemory, setContinuousMemory] = useState('');
+  const [liveTerminalSteps, setLiveTerminalSteps] = useState<TerminalStep[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -389,6 +400,7 @@ export function ChatInterface() {
     const planState: PlanState = { ...INITIAL_PLAN_STATE };
     setActivePlan({ ...planState });
     setSubAgentRuns([]);
+    setLiveTerminalSteps([]);
     setLiveExchanges([{ role: 'user' as const, label: 'User prompt', content: trimmed, phase: 'input' }]);
 
     // Create abort controller for this pipeline run
@@ -468,12 +480,67 @@ export function ChatInterface() {
         content: m.content,
       }));
 
-      const p5 = await callPlanPhase('execute', {
-        ...basePayload,
-        phase: 'execute',
-        messages: execMessages,
-        plan: finalPlanForExecution,
-      }, signal);
+      // Use streaming endpoint for live terminal display
+      const p5 = await (async () => {
+        const res = await fetch('/api/chat/execute-stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...basePayload,
+            userPrompt: trimmed,
+            messages: execMessages,
+            plan: finalPlanForExecution,
+          }),
+          signal,
+        });
+
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ error: 'Execute failed' }));
+          throw new Error(err.error || 'Execute failed');
+        }
+
+        const reader = res.body!.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let result: { reply: string; toolCalls: any[] } = { reply: '', toolCalls: [] };
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+
+          // Parse SSE events from buffer
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || ''; // Keep incomplete line
+
+          let eventType = '';
+          for (const line of lines) {
+            if (line.startsWith('event: ')) {
+              eventType = line.slice(7).trim();
+            } else if (line.startsWith('data: ')) {
+              const data = JSON.parse(line.slice(6));
+              if (eventType === 'tool_call') {
+                // Live update terminal with each tool call as it completes
+                const tc = data.toolCall;
+                setLiveTerminalSteps(prev => [...prev, {
+                  stepIndex: data.stepIndex,
+                  action: tc.name,
+                  toolName: tc.name,
+                  args: typeof tc.arguments === 'string' ? JSON.parse(tc.arguments || '{}') : (tc.arguments || {}),
+                  status: tc.status || 'success',
+                  result: tc.result,
+                  startedAt: Date.now(),
+                }]);
+              } else if (eventType === 'done') {
+                result = data;
+              } else if (eventType === 'error') {
+                throw new Error(data.error);
+              }
+            }
+          }
+        }
+        return result;
+      })();
 
       // Push execute exchanges live
       const execExtra: { role: Exchange['role']; label: string; content: string }[] = [];
@@ -650,6 +717,190 @@ export function ChatInterface() {
     }
   };
 
+  // ── Continuous mode handler ─────────────────────────────────────
+  const handleSendContinuous = async () => {
+    const trimmed = input.trim();
+    if (!trimmed || loading) return;
+
+    // Intercept slash commands
+    if (trimmed.toLowerCase() === '/tools') return handleToolsCommand();
+    if (trimmed.toLowerCase() === '/skills') return handleSkillsCommand();
+
+    const userMsg: Message = { role: 'user', content: trimmed };
+    setMessages((prev) => [...prev, userMsg]);
+    setInput('');
+    setLoading(true);
+
+    setContinuousIterations([]);
+    setContinuousMemory('');
+    setLiveTerminalSteps([]);
+    setLiveExchanges([{ role: 'user' as const, label: 'User prompt', content: trimmed, phase: 'input' }]);
+
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+    const signal = abortController.signal;
+
+    let skillsData: { name: string; content: string }[] = [];
+    try {
+      const sr = await fetch('/api/skills');
+      const sd = await sr.json();
+      skillsData = (sd.skills || []).map((s: any) => ({ name: s.name, content: s.content }));
+    } catch {}
+
+    let memory = '';
+    let previousSummary = '';
+    const allIterations: ContinuousIteration[] = [];
+
+    try {
+      for (let iteration = 1; iteration <= MAX_CONTINUOUS_ITERATIONS; iteration++) {
+        if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+
+        // Add running placeholder
+        const runningIter: ContinuousIteration = {
+          iteration,
+          status: 'running',
+          thinking: '',
+          actions: '',
+          reply: '',
+          toolCalls: [],
+          summary: '',
+          progressPct: 0,
+          startedAt: Date.now(),
+        };
+        allIterations.push(runningIter);
+        setContinuousIterations([...allIterations]);
+
+        const res = await fetch('/api/chat/continuous', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            userPrompt: trimmed,
+            iteration,
+            memory,
+            previousSummary,
+            selectedFiles,
+            skills: skillsData,
+          }),
+          signal,
+        });
+
+        const data = await res.json();
+        if (data.error) throw new Error(data.error);
+
+        // Update iteration with results
+        const finishedIter: ContinuousIteration = {
+          iteration,
+          status: data.isComplete ? 'complete' : (data.status === 'error' ? 'error' : 'progress'),
+          thinking: data.thinking || '',
+          actions: data.actions || '',
+          reply: data.reply || '',
+          toolCalls: data.toolCalls || [],
+          summary: data.summary || '',
+          progressPct: data.progressPct || 0,
+          startedAt: runningIter.startedAt,
+          finishedAt: Date.now(),
+        };
+        allIterations[iteration - 1] = finishedIter;
+        setContinuousIterations([...allIterations]);
+
+        // Update memory
+        memory = data.memory || memory;
+        setContinuousMemory(memory);
+        previousSummary = data.summary || '';
+
+        // Push live exchanges
+        pushLiveExchanges(`iter-${iteration}`, undefined, [
+          { role: 'user' as const, label: `Iter ${iteration} think prompt`, content: data.thinkPrompt || '' },
+          { role: 'assistant' as const, label: `Iter ${iteration} think response`, content: data.thinkResponse || '' },
+          ...(data.actPrompt ? [{ role: 'user' as const, label: `Iter ${iteration} act prompt`, content: data.actPrompt }] : []),
+          ...(data.actResponse ? [{ role: 'assistant' as const, label: `Iter ${iteration} act response`, content: data.actResponse }] : []),
+        ]);
+
+        // Update live terminal steps from this iteration
+        const iterSteps: TerminalStep[] = (data.toolCalls || []).map((tc: any, i: number) => ({
+          stepIndex: liveTerminalSteps.length + i,
+          action: tc.name,
+          toolName: tc.name,
+          args: tc.arguments || {},
+          status: tc.status || 'success',
+          result: tc.result,
+          startedAt: runningIter.startedAt,
+          finishedAt: Date.now(),
+        }));
+        setLiveTerminalSteps(prev => [...prev, ...iterSteps]);
+
+        // Check if done
+        if (data.isComplete || data.status === 'complete') break;
+
+        // If all tools errored, still continue (the model will adapt) — unless max retries
+      }
+
+      // Save MEMORY.md to sandbox
+      if (memory) {
+        try {
+          const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+          await fetch('/api/files', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: `MEMORY-${ts}.md`, content: memory }),
+          });
+          refreshFiles();
+        } catch {}
+      }
+
+      const lastIter = allIterations[allIterations.length - 1];
+      const finalReply = lastIter?.reply || lastIter?.summary || 'Continuous execution complete.';
+
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: 'assistant',
+          content: finalReply,
+          toolCalls: allIterations.flatMap(i => i.toolCalls || []),
+          continuousIterations: [...allIterations],
+          continuousMemory: memory,
+        },
+      ]);
+
+      refreshFiles();
+    } catch (err: any) {
+      const isAbort = err?.name === 'AbortError' || signal.aborted;
+      if (isAbort) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: 'assistant',
+            content: 'Continuous execution aborted.',
+            continuousIterations: [...allIterations],
+            continuousMemory: memory,
+          },
+        ]);
+      } else {
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: 'assistant',
+            content: `Continuous mode error: ${err.message || 'Unknown error'}`,
+            continuousIterations: [...allIterations],
+            continuousMemory: memory,
+          },
+        ]);
+      }
+    } finally {
+      abortControllerRef.current = null;
+      setLoading(false);
+    }
+  };
+
+  // ── Unified send dispatcher ────────────────────────────────────
+  const handleSendDispatch = () => {
+    if (chatMode === 'continuous') {
+      handleSendContinuous();
+    } else {
+      handleSend();
+    }
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
     // ── Slash-suggestion keyboard navigation ─────────────────
     if (slashSuggestions.length > 0) {
@@ -680,7 +931,7 @@ export function ChatInterface() {
 
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      handleSend();
+      handleSendDispatch();
     }
   };
 
@@ -760,6 +1011,25 @@ export function ChatInterface() {
         <span className="navbar-brand mb-0 h1">
           <i className="bi bi-robot me-2"></i>AI Sandbox Chat
         </span>
+        {/* ── Mode switcher ──────────────────────────── */}
+        <div className="btn-group btn-group-sm" role="group">
+          <button
+            className={`btn ${chatMode === 'plan' ? 'btn-info' : 'btn-outline-secondary'}`}
+            onClick={() => setChatMode('plan')}
+            disabled={loading}
+            title="Plan mode: 4-phase pipeline (understand → gather → plan → execute)"
+          >
+            <i className="bi bi-list-check me-1"></i>Plan
+          </button>
+          <button
+            className={`btn ${chatMode === 'continuous' ? 'btn-warning' : 'btn-outline-secondary'}`}
+            onClick={() => setChatMode('continuous')}
+            disabled={loading}
+            title="Continuous mode: fast iterative loop"
+          >
+            <i className="bi bi-lightning-charge-fill me-1"></i>Continuous
+          </button>
+        </div>
         <div className="d-flex gap-2">
           <button className="btn btn-outline-light btn-sm" onClick={handleNewFile}>
             <i className="bi bi-file-earmark-plus me-1"></i>New MD
@@ -914,9 +1184,26 @@ export function ChatInterface() {
               <div key={i}>
                 <MessageBubble role={msg.role} content={msg.content} />
                 {msg.planState && <PlanDisplay planState={msg.planState} />}
-                {msg.toolCalls?.map((tc, j) => (
-                  <ToolCallDisplay key={j} toolCall={tc} />
-                ))}
+                {/* Continuous mode: show iterations display */}
+                {msg.continuousIterations && msg.continuousIterations.length > 0 && (
+                  <ContinuousDisplay
+                    iterations={msg.continuousIterations}
+                    memory={msg.continuousMemory || ''}
+                  />
+                )}
+                {/* Plan mode: show terminal for tool calls */}
+                {msg.toolCalls && msg.toolCalls.length > 0 && !msg.continuousIterations && (
+                  <TerminalDisplay
+                    steps={msg.toolCalls.map((tc: any, j: number) => ({
+                      stepIndex: j,
+                      action: tc.name,
+                      toolName: tc.name,
+                      args: typeof tc.arguments === 'string' ? JSON.parse(tc.arguments || '{}') : (tc.arguments || {}),
+                      status: tc.status || 'success',
+                      result: tc.result,
+                    }))}
+                  />
+                )}
                 {msg.subAgentRuns && msg.subAgentRuns.length > 0 && (
                   <SubAgentDisplay runs={msg.subAgentRuns} />
                 )}
@@ -925,15 +1212,31 @@ export function ChatInterface() {
 
             {loading && (
               <>
-                <PlanDisplay planState={activePlan} onAbort={handleAbort} />
-                {subAgentRuns.length > 0 && (
-                  <SubAgentDisplay runs={subAgentRuns} onAbort={handleAbort} />
+                {/* Plan mode loading */}
+                {chatMode === 'plan' && (
+                  <>
+                    <PlanDisplay planState={activePlan} onAbort={handleAbort} />
+                    {subAgentRuns.length > 0 && (
+                      <SubAgentDisplay runs={subAgentRuns} onAbort={handleAbort} />
+                    )}
+                    {liveTerminalSteps.length > 0 && (
+                      <TerminalDisplay steps={liveTerminalSteps} />
+                    )}
+                    {!activePlan.currentPhase && subAgentRuns.length === 0 && (
+                      <div className="d-flex align-items-center gap-2 text-muted ms-2 mb-2">
+                        <div className="spinner-border spinner-border-sm" />
+                        <span>Thinking…</span>
+                      </div>
+                    )}
+                  </>
                 )}
-                {!activePlan.currentPhase && subAgentRuns.length === 0 && (
-                  <div className="d-flex align-items-center gap-2 text-muted ms-2 mb-2">
-                    <div className="spinner-border spinner-border-sm" />
-                    <span>Thinking…</span>
-                  </div>
+                {/* Continuous mode loading */}
+                {chatMode === 'continuous' && (
+                  <ContinuousDisplay
+                    iterations={continuousIterations}
+                    memory={continuousMemory}
+                    onAbort={handleAbort}
+                  />
                 )}
               </>
             )}
@@ -995,7 +1298,7 @@ export function ChatInterface() {
               />
               <button
                 className="btn btn-primary"
-                onClick={handleSend}
+                onClick={handleSendDispatch}
                 disabled={loading || !input.trim()}
               >
                 <i className="bi bi-send"></i>

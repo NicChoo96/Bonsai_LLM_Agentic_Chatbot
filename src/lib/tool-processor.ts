@@ -216,6 +216,7 @@ function buildVerificationPrompt(executed: ToolCall[]): string {
 // ─── Main chat-with-tools loop ───────────────────────────────────
 export async function runChatWithTools(
   messages: CompletionMessage[],
+  onToolCall?: (toolCall: ToolCall) => void,
 ): Promise<{ reply: string; toolCalls: ToolCall[] }> {
   const allToolCalls: ToolCall[] = [];
   let consecutiveErrors = 0;
@@ -234,6 +235,11 @@ export async function runChatWithTools(
     // Execute tool calls
     const executed = await processToolCalls(parsed);
     allToolCalls.push(...executed);
+
+    // Notify caller of each completed tool call for live streaming
+    if (onToolCall) {
+      for (const tc of executed) onToolCall(tc);
+    }
 
     // Check if any calls errored
     const hasErrors = executed.some((tc) => tc.status === 'error');

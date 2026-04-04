@@ -414,6 +414,11 @@ export async function POST(req: NextRequest) {
       const systemContent = [
         'You are an AI planning assistant. Create a step-by-step execution plan.',
         '',
+        'IMPORTANT DISTINCTION — Tools vs Skills:',
+        '  TOOLS are callable functions that perform concrete actions (read files, fetch web pages, run commands).',
+        '  SKILLS are instruction sets that guide HOW you respond — they change your behavior/output format, NOT tool calls.',
+        '  A skill is NOT a tool. You CANNOT "call" a skill. Instead, a skill provides instructions you follow when generating your response.',
+        '',
         'IMPORTANT: Not every task needs tools. If the request can be fully answered with a direct text response',
         '(questions, explanations, code review, brainstorming, creative writing, etc.), create a single step',
         'with tool: "none" that describes generating the response. Do NOT force tool usage where it is not needed.',
@@ -425,13 +430,14 @@ export async function POST(req: NextRequest) {
         '  "steps": an ordered array of step objects, each with:',
         '    "step": step number (1, 2, 3...)',
         '    "action": what to do in plain English',
-        '    "tool": the tool name to call (or "none" for direct AI response steps)',
+        '    "tool": the TOOL name to call (or "none" if no tool needed). MUST be from the Available Tools list below. NEVER put a skill name here.',
+        '    "skill": the SKILL name to apply for this step (or null). Skills provide instructions to follow, not tool calls.',
         '    "args": predicted arguments object for the tool call (or null)',
         '    "depends_on": array of step numbers this depends on (or [])',
         '  "summary": a one-line summary of the full plan',
         '',
-        `Available tools:\n${toolDocs}`,
-        skillDocs ? `\nAvailable skills:\n${skillDocs}` : '',
+        `Available tools (ONLY these names are valid for the "tool" field):\n${toolDocs}`,
+        skillDocs ? `\nAvailable skills (these are INSTRUCTION SETS, not tools — use the "skill" field):\n${skillDocs}` : '',
         `\nSandbox files: [${fileList}]`,
         bootstrapContext ? `\nFile contents:\n${bootstrapContext}` : '',
       ].filter(Boolean).join('\n');
@@ -566,21 +572,44 @@ export async function POST(req: NextRequest) {
       // ── Tool-based execution ───────────────────────────────
       // Build selective tool docs: only include tools referenced in the plan
       const planToolNames = new Set<string>();
+      const planSkillNames = new Set<string>();
+      const allToolNameSet = new Set(getAllTools().map(t => t.name));
       if (plan?.steps?.length) {
         for (const s of plan.steps as any[]) {
-          if (s.tool && s.tool !== 'none') planToolNames.add(s.tool);
+          if (s.tool && s.tool !== 'none') {
+            // Only add if it's actually a real tool, not a skill name
+            if (allToolNameSet.has(s.tool)) {
+              planToolNames.add(s.tool);
+            }
+          }
+          // Also collect skills referenced in the plan
+          if (s.skill) {
+            planSkillNames.add(s.skill);
+          }
         }
       }
       // Always include a few core tools for fallback
       ['sandbox_list_files', 'sandbox_read_file', 'search_files'].forEach((t) => planToolNames.add(t));
       const toolPrompt = buildToolSystemPrompt(planToolNames);
 
-      const skillContext = (skills || []).length > 0
-        ? `\n\nLoaded Skills:\n${skills.map((s) => `[Skill: ${s.name}]\n${s.content}`).join('\n---\n')}`
-        : '';
+      // Build skill context — make skills that are in the plan extra prominent
+      const planSkills = (skills || []).filter(s => planSkillNames.has(s.name));
+      const otherSkills = (skills || []).filter(s => !planSkillNames.has(s.name));
+      let skillContext = '';
+      if (planSkills.length > 0) {
+        skillContext += `\n\n═══ ACTIVE SKILLS (follow these instructions) ═══\n${planSkills.map((s) => `[Skill: ${s.name}]\n${s.content}`).join('\n---\n')}\n═══════════════════════════════════════════════════`;
+      }
+      if (otherSkills.length > 0) {
+        skillContext += `\n\nOther available skills:\n${otherSkills.map((s) => `[Skill: ${s.name}]\n${s.content}`).join('\n---\n')}`;
+      }
 
       const planContext = plan?.steps?.length
-        ? `\n\nYou MUST follow this execution plan step by step:\n${plan.steps.map((s: any) => `${s.step}. ${s.action}${s.tool !== 'none' ? ` [use tool: ${s.tool}]` : ''}`).join('\n')}`
+        ? `\n\nYou MUST follow this execution plan step by step:\n${plan.steps.map((s: any) => {
+            let desc = `${s.step}. ${s.action}`;
+            if (s.tool && s.tool !== 'none') desc += ` [use tool: ${s.tool}]`;
+            if (s.skill) desc += ` [follow skill: ${s.skill}]`;
+            return desc;
+          }).join('\n')}`
         : '';
 
       const systemContent = [
