@@ -124,10 +124,12 @@ export async function POST(req: NextRequest) {
           '',
           'CATEGORY HINTS:',
           '- To OPEN/LAUNCH/PLAY a file → "desktop_utils" (has open_app tool)',
+          '- To OPEN RANDOM files from a directory → "desktop_utils" with open_app(app="path", count="N", random="true", filter=".ext") — this is ONE step, not two.',
+          '- NEVER create a separate pure-text step for "select random files" or "pick N items" — random selection REQUIRES a tool (open_app or run_python). Always needs_tool=true.',
           '- To FIND/SEARCH for files/folders → "search" + walk_mode: true',
           '- To READ/INSPECT file contents → "host_filesystem"',
           '- To RUN commands → "shell_exec"',
-          '- NEVER plan to copy host files into the sandbox — that is a security violation.',
+          '- NEVER plan to copy host files into the sandbox — that is a security violation.',,
           '',
           `Available tool categories:\n${categoryDocs}`,
           '',
@@ -184,10 +186,11 @@ export async function POST(req: NextRequest) {
           '6. SECURITY: No step should copy host files into the sandbox. To open a file, use "desktop_utils" category.',
           '',
           'CATEGORY REFERENCE:',
-          '- "desktop_utils" → open/launch/play files or apps (open_app tool)',
+          '- "desktop_utils" → open/launch/play files or apps (open_app tool). Also handles opening random files from a directory with count/random/filter params — don\'t split this into separate steps.',
           '- "search" → find/locate files or folders (with walk_mode: true)',
           '- "host_filesystem" → read/write/inspect files on host',
           '- "shell_exec" → run shell commands',
+          '- IMPORTANT: Steps involving random selection, counting, filtering, or any data manipulation MUST have needs_tool=true.',
           '',
           `Available tool categories:\n${categoryDocs}`,
           '',
@@ -281,7 +284,12 @@ export async function POST(req: NextRequest) {
               '',
               walkToolPrompt,
               '',
-              'Once you find the target, state the full path and STOP. Do not make additional tool calls.',
+              'CRITICAL OUTPUT FORMAT:',
+              'After finding the target, you MUST respond with JSON containing the key data:',
+              '{ "found": true, "path": "FULL_ABSOLUTE_PATH", "type": "file|directory", "items": ["name1", "name2", ...] }',
+              'The path MUST be the real resolved absolute path. items is optional (include if you listed contents).',
+              'If NOT found: { "found": false, "searched": ["dirs searched"], "error": "why not found" }',
+              'ONLY output JSON. No prose. The next step depends on parsing this output.',
             ].filter(Boolean).join('\n');
 
             const walkMessages: CompletionMessage[] = [
@@ -337,50 +345,56 @@ export async function POST(req: NextRequest) {
             stepReply = stripToolCallBlocks(walkReply || '');
             stepToolCalls = walkCalls;
 
-            // Fallback: if stepReply is empty but tools found a path, synthesize from tool data
-            if (!stepReply) {
-              for (const tc of walkCalls) {
-                if (tc.status !== 'success' || !tc.result) continue;
-                if (tc.name === 'walk_search' || tc.name === 'find_directory') {
-                  try {
-                    const data = JSON.parse(tc.result);
-                    if (data.results?.[0]?.path) {
-                      stepReply = `Found target at: ${data.results[0].path}`;
-                      break;
-                    }
-                  } catch { /* skip */ }
+            // Synthesize structured data from ALL tool results regardless of stepReply
+            // This ensures we always have usable data for handoff
+            let walkFoundPath = '';
+            let walkFoundItems: string[] = [];
+            for (const tc of walkCalls) {
+              if (tc.status !== 'success' || !tc.result) continue;
+              try {
+                const data = JSON.parse(tc.result);
+                // walk_search / find_directory results
+                if (data.results?.[0]?.path) {
+                  walkFoundPath = walkFoundPath || data.results[0].path;
                 }
-                // Also try extracting drive paths from any successful result
-                if (!stepReply && tc.result) {
-                  const pathMatch = tc.result.match(/[A-Z]:\\[^\s"',\]]+/g);
-                  if (pathMatch?.length) {
-                    stepReply = `Found path: ${pathMatch[0]}`;
-                    break;
-                  }
+                // host_list_dir / directory_tree results
+                if (data.resolvedPath) {
+                  walkFoundPath = walkFoundPath || data.resolvedPath;
+                }
+                if (data.path) {
+                  walkFoundPath = walkFoundPath || data.path;
+                }
+                // Extract items/files list
+                if (data.items && Array.isArray(data.items)) {
+                  walkFoundItems = data.items.map((i: any) => i.name || i.Name || i.FullName || String(i)).slice(0, 50);
+                }
+                if (data.files && Array.isArray(data.files)) {
+                  walkFoundItems = data.files.slice(0, 50);
+                }
+              } catch {
+                // Try regex path extraction from non-JSON results
+                const pathMatch = tc.result.match(/[A-Z]:\\[^\s"',\]}{]+(?:\\[^\s"',\]}{]+)*/g);
+                if (pathMatch?.length) {
+                  // Filter out short drive roots like "E:\\" — we want real paths
+                  const realPaths = pathMatch.filter((p: string) => p.length > 4);
+                  if (realPaths.length > 0) walkFoundPath = walkFoundPath || realPaths[0];
                 }
               }
+            }
+
+            // Always create structured JSON reply for handoff
+            if (walkFoundPath) {
+              const structured: any = { found: true, path: walkFoundPath, type: 'directory' };
+              if (walkFoundItems.length > 0) structured.items = walkFoundItems;
+              stepReply = JSON.stringify(structured);
+            } else if (!stepReply) {
+              stepReply = JSON.stringify({ found: false, searched: walkCalls.map(tc => tc.name).join(', '), error: 'No path found in tool results' });
             }
 
             sendEvent('exchange', { phase: `step-${stepIndex}-walk`, role: 'assistant', label: `Step ${stepIndex} walk result`, content: stepReply });
 
-            // Evaluate walk result — check tool results first, then reply text
-            let walkFound = false;
-            for (const tc of walkCalls) {
-              if (tc.status !== 'success' || !tc.result) continue;
-              if (tc.name === 'walk_search' || tc.name === 'find_directory') {
-                try {
-                  const data = JSON.parse(tc.result);
-                  if (data.count > 0 || (data.results && data.results.length > 0)) {
-                    walkFound = true;
-                    break;
-                  }
-                } catch { /* skip */ }
-              }
-            }
-            // Fallback: check reply text for drive paths
-            if (!walkFound) {
-              walkFound = stepReply.match(/[A-Z]:\\.+/) !== null;
-            }
+            // Evaluate walk result — use the synthesized walkFoundPath
+            const walkFound = !!walkFoundPath || stepReply.match(/[A-Z]:\\.+/) !== null;
 
             if (!walkFound && walkCalls.length > 0) {
               sendEvent('step_retry', {
@@ -545,20 +559,56 @@ export async function POST(req: NextRequest) {
                 filteredSkillContext,
                 skillCatalog,
                 '',
-                'When done, provide a clear summary of what was accomplished.',
+                'OUTPUT FORMAT — You MUST end your response with a JSON block containing the key data from this step:',
+                '```json',
+                '{ "status": "success|error", "action": "what was done", "paths": ["paths used"], "data": { ...any key output... } }',
+                '```',
+                'This JSON is critical — the NEXT step reads it. Include resolved paths, file names, counts, and any important findings.',
+                'Put the JSON at the END after any tool calls. Always include it even if tools failed (set status to "error" with reason).',
               ].filter(Boolean).join('\n');
 
               // Build explicit handoff from previous step
               const prevResult = stepResults.length > 0
                 ? stepResults[stepResults.length - 1]
                 : null;
-              const handoff = prevResult
-                ? `\n\nPREVIOUS STEP OUTPUT (Step ${prevResult.index}: ${prevResult.description}):\n${prevResult.result.slice(0, 600)}`
-                : '';
+              // Extract structured data from previous step's reply and tool results
+              let structuredHandoff = '';
+              if (prevResult) {
+                // First: try to parse structured JSON from the step reply itself
+                let parsed: any = null;
+                try {
+                  // Try direct JSON parse
+                  parsed = JSON.parse(prevResult.result);
+                } catch {
+                  // Try extracting JSON block from markdown ```json ... ```
+                  const jsonBlock = prevResult.result.match(/```json\s*([\s\S]*?)```/);
+                  if (jsonBlock?.[1]) {
+                    try { parsed = JSON.parse(jsonBlock[1].trim()); } catch { /* ignore */ }
+                  }
+                }
+                if (parsed) {
+                  structuredHandoff = `\n\nPREVIOUS STEP DATA (Step ${prevResult.index}: ${prevResult.description}):\n${JSON.stringify(parsed, null, 2)}`;
+                } else {
+                  // Fallback: text handoff + extract paths from tool results
+                  let resolvedPathHint = '';
+                  for (const tc of prevResult.toolCalls || []) {
+                    if (tc.status === 'success' && tc.result) {
+                      try {
+                        const tcData = typeof tc.result === 'string' ? JSON.parse(tc.result) : tc.result;
+                        if (tcData?.resolvedPath) {
+                          resolvedPathHint = `\nRESOLVED PATH: ${tcData.resolvedPath} (use this exact path in subsequent tools)`;
+                          break;
+                        }
+                      } catch { /* not JSON */ }
+                    }
+                  }
+                  structuredHandoff = `\n\nPREVIOUS STEP OUTPUT (Step ${prevResult.index}: ${prevResult.description}):\n${prevResult.result.slice(0, 1200)}${resolvedPathHint}`;
+                }
+              }
 
               const execMessages: CompletionMessage[] = [
                 { role: 'system', content: execSystem },
-                { role: 'user', content: `Execute step ${stepIndex}: ${stepDesc}${handoff}` },
+                { role: 'user', content: `Execute step ${stepIndex}: ${stepDesc}${structuredHandoff}` },
               ];
 
               sendEvent('exchange', { phase: `step-${stepIndex}-a${attempt}`, role: 'user', label: `Step ${stepIndex} exec (attempt ${attempt})`, content: execMessages[1].content });
@@ -676,13 +726,47 @@ export async function POST(req: NextRequest) {
               filteredSkillContext,
               skillCatalog,
               '',
-              'Complete this step with a direct, thorough response.',
+              'CRITICAL OUTPUT FORMAT:',
+              'You MUST respond with a JSON object containing the key data for this step:',
+              '{ "status": "success|error", "action": "what was done", "data": { ...relevant output... } }',
+              '',
+              'For example, if selecting files: { "status": "success", "action": "Selected 2 random files", "data": { "selected": ["file1.mp4", "file2.mp4"], "source_path": "/path/to/dir" } }',
+              'ONLY output JSON. No prose. The next step depends on parsing your output to get concrete data like paths, file names, counts, etc.',
+              'If previous step data is incomplete (e.g. no path or file list), set status to "error" and explain what is missing.',
             ].filter(Boolean).join('\n');
 
             const prevDirect = stepResults.length > 0 ? stepResults[stepResults.length - 1] : null;
-            const directHandoff = prevDirect
-              ? `\n\nPREVIOUS STEP OUTPUT (Step ${prevDirect.index}: ${prevDirect.description}):\n${prevDirect.result.slice(0, 600)}`
-              : '';
+            // Extract structured data from previous step's reply
+            let directHandoff = '';
+            if (prevDirect) {
+              let parsed: any = null;
+              try {
+                parsed = JSON.parse(prevDirect.result);
+              } catch {
+                const jsonBlock = prevDirect.result.match(/```json\s*([\s\S]*?)```/);
+                if (jsonBlock?.[1]) {
+                  try { parsed = JSON.parse(jsonBlock[1].trim()); } catch { /* ignore */ }
+                }
+              }
+              if (parsed) {
+                directHandoff = `\n\nPREVIOUS STEP DATA (Step ${prevDirect.index}: ${prevDirect.description}):\n${JSON.stringify(parsed, null, 2)}`;
+              } else {
+                // Fallback: text handoff + extract paths from tool results
+                let directResolvedHint = '';
+                for (const tc of prevDirect.toolCalls || []) {
+                  if (tc.status === 'success' && tc.result) {
+                    try {
+                      const tcData = typeof tc.result === 'string' ? JSON.parse(tc.result) : tc.result;
+                      if (tcData?.resolvedPath) {
+                        directResolvedHint = `\nRESOLVED PATH: ${tcData.resolvedPath} (use this exact path)`;
+                        break;
+                      }
+                    } catch { /* not JSON */ }
+                  }
+                }
+                directHandoff = `\n\nPREVIOUS STEP OUTPUT (Step ${prevDirect.index}: ${prevDirect.description}):\n${prevDirect.result.slice(0, 1200)}${directResolvedHint}`;
+              }
+            }
 
             sendEvent('exchange', { phase: `step-${stepIndex}`, role: 'user', label: `Step ${stepIndex} exec`, content: `Complete step ${stepIndex}: ${stepDesc}` });
 
@@ -707,7 +791,18 @@ export async function POST(req: NextRequest) {
 
           // Update memory with step result + key tool output data
           memory += `\n## Step ${stepIndex}: ${stepDesc}\n`;
-          memory += `Result: ${stepReply.slice(0, 500)}\n`;
+          // Try to parse structured JSON from step reply for concise memory
+          let memoryParsed: any = null;
+          try { memoryParsed = JSON.parse(stepReply); } catch {
+            const jb = stepReply.match(/```json\s*([\s\S]*?)```/);
+            if (jb?.[1]) { try { memoryParsed = JSON.parse(jb[1].trim()); } catch { /* */ } }
+          }
+          if (memoryParsed) {
+            // Store structured data compactly
+            memory += `Data: ${JSON.stringify(memoryParsed)}\n`;
+          } else {
+            memory += `Result: ${stepReply.slice(0, 500)}\n`;
+          }
           if (stepToolCalls.length > 0) {
             memory += `Tools: ${stepToolCalls.map(tc => `${tc.name}(${tc.status})`).join(', ')}\n`;
             // Extract key data from successful tool results (paths, files found, etc.)

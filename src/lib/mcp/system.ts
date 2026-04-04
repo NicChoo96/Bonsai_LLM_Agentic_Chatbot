@@ -426,17 +426,20 @@ const tools: McpToolDefinition[] = [
   {
     name: 'open_app',
     description:
-      'Launch a Windows application or open a file with its default program. ' +
+      'Launch a Windows application, open a file, OR open random files from a directory. ' +
       'Uses Python os.startfile() for reliable file opening (works for videos, images, PDFs, etc.). ' +
-      'If given a DIRECTORY path instead of a file, returns a list of files in that directory so you can pick one. ' +
-      'If the file is not found, auto-searches nearby for similar filenames and suggests candidates. ' +
-      'Use full absolute paths (e.g. "C:\\Folder\\file.mp4"), NOT sandbox-relative paths. ' +
-      'IMPORTANT: You must know the actual filename — do NOT guess or invent filenames. ' +
-      'Use host_list_dir first to see what files exist, then open_app with an exact filename.',
+      'DIRECTORY MODE: If given a directory path, set count to open N files. Set random="true" to pick randomly. ' +
+      'Use filter to limit by extension (e.g. ".mp4,.avi"). Auto-resolves the path if not found exactly. ' +
+      'Example: open_app(app="C:\\folderName", count="2", random="true", filter=".mp4") opens 2 random videos. ' +
+      'FILE MODE: Opens a specific file with its default program. Auto-searches if file not found. ' +
+      'APP MODE: Plain name like "notepad" or "calc" launches the application.',
     parameters: {
       type: 'object',
       properties: {
-        app: { type: 'string', description: 'Application name or full absolute file path (e.g. "notepad", "calc", "E:\\Videos\\clip.mp4").' },
+        app: { type: 'string', description: 'Application name, absolute file path, or absolute directory path.' },
+        count: { type: 'string', description: 'Number of files to open from a directory (default "1"). Only used when app is a directory.' },
+        random: { type: 'string', description: '"true" to pick files randomly from a directory. Default is alphabetical order.' },
+        filter: { type: 'string', description: 'Comma-separated extensions to filter by (e.g. ".mp4,.avi,.mkv"). Only used with directories.' },
       },
       required: ['app'],
     },
@@ -588,12 +591,33 @@ function isDestructive(cmd: string): boolean {
   return DESTRUCTIVE_PATTERNS.some((p) => p.test(cmd));
 }
 
+/** Validate cwd — if the directory doesn't exist, fall back to DEFAULT_CWD.
+ *  Prevents "spawn ENOENT" crashes when the AI passes a non-existent directory. */
+async function safeCwd(cwd?: string): Promise<string> {
+  if (!cwd) return DEFAULT_CWD;
+  try {
+    const stat = await fs.stat(cwd);
+    if (stat.isDirectory()) return cwd;
+  } catch { /* doesn't exist */ }
+  // Try to auto-resolve the directory name
+  const dirName = path.basename(cwd);
+  const driveRoot = inferSearchRoot(cwd);
+  try {
+    const cmd = `dir "${driveRoot}\\" /s /b /ad 2>nul | findstr /i /e "\\\\${dirName}"`;
+    const { stdout } = await execAsync(cmd, { cwd: DEFAULT_CWD, timeout: 10000, windowsHide: true, shell: 'cmd.exe' });
+    const lines = stdout.trim().split(/\r?\n/).filter(Boolean);
+    if (lines.length > 0) return lines[0].trim();
+  } catch { /* search failed */ }
+  return DEFAULT_CWD;
+}
+
 async function runCmd(
   command: string,
   cwd?: string,
 ): Promise<{ stdout: string; stderr: string }> {
+  const resolvedCwd = await safeCwd(cwd);
   const { stdout, stderr } = await execAsync(command, {
-    cwd: cwd || DEFAULT_CWD,
+    cwd: resolvedCwd,
     timeout: CMD_TIMEOUT,
     maxBuffer: 1024 * 1024,
     windowsHide: true,
@@ -609,10 +633,11 @@ async function runPs(
   script: string,
   cwd?: string,
 ): Promise<{ stdout: string; stderr: string }> {
+  const resolvedCwd = await safeCwd(cwd);
   const { stdout, stderr } = await execAsync(
     `powershell -NoProfile -NonInteractive -Command "${script.replace(/"/g, '\\"')}"`,
     {
-      cwd: cwd || DEFAULT_CWD,
+      cwd: resolvedCwd,
       timeout: CMD_TIMEOUT,
       maxBuffer: 1024 * 1024,
       windowsHide: true,
@@ -920,11 +945,24 @@ async function execute(
         }
 
         // Fix common AI escaping issues in path strings:
-        // 1. Double-backslash in raw strings: r'E:\\Work' → r'E:\Work' (AI over-escapes in JSON)
+        // Double-backslash in raw strings: r'E:\\Work' → r'E:\Work' (AI over-escapes in JSON)
         script = script.replace(/(r['"])((?:[^'"\\]|\\.)*)(['"])/g, (_match, prefix, body, suffix) => {
-          // Inside raw strings, replace \\\\ (two backslashes) with \\ (one backslash)
           return prefix + body.replace(/\\\\/g, '\\') + suffix;
         });
+
+        // Fix raw strings ending with backslash before closing quote (always a Python SyntaxError)
+        // r'E:\path\' + var → r'E:\path/' + var  (forward slash works on Windows Python)
+        script = script.replace(/r'([^']*[^\\])\\'/g, "r'$1/'");
+        script = script.replace(/r"([^"]*[^\\])\\"/g, 'r"$1/"');
+
+        // Fix one-liner scripts: semicolons with `for`/`if`/`while`/`with`/`try` on same line
+        // Python doesn't allow block statements after semicolons on one line
+        if (!script.includes('\n') && /;\s*(for|if|while|with|try)\b/.test(script)) {
+          script = script.replace(/;\s*/g, '\n');
+        }
+
+        // Validate cwd — prevent spawn ENOENT
+        const pyCwd = await safeCwd(args.cwd as string | undefined);
 
         // Write script to a temp file and execute it
         const tmpDir = os.tmpdir();
@@ -932,7 +970,7 @@ async function execute(
         try {
           await fs.writeFile(tmpFile, script, 'utf-8');
           const { stdout, stderr } = await execAsync(`python "${tmpFile}"`, {
-            cwd: (args.cwd as string) || DEFAULT_CWD,
+            cwd: pyCwd,
             timeout: CMD_TIMEOUT,
             maxBuffer: 1024 * 1024,
             windowsHide: true,
@@ -942,15 +980,37 @@ async function execute(
             data: {
               stdout: stdout.slice(0, MAX_OUTPUT),
               stderr: stderr.slice(0, MAX_OUTPUT),
+              ...(pyCwd !== (args.cwd as string) && args.cwd ? { cwdNote: `cwd "${args.cwd}" not found, used "${pyCwd}" instead` } : {}),
             },
           };
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
-          // Return the error but as a structured result so the AI can retry with a fixed script
+          // If the error is a FileNotFoundError for a path, hint at the resolved cwd
+          let cwdHint = pyCwd !== (args.cwd as string) && args.cwd
+            ? ` Note: cwd "${args.cwd}" didn't exist, used "${pyCwd}". Your script paths may also need correcting.`
+            : '';
+
+          // Auto-resolve paths from FileNotFoundError messages
+          const pathMatch = msg.match(/(?:FileNotFoundError|cannot find the path|No such file or directory).*?['"](([A-Za-z]:\\[^'"]+)|([/\\][^'"]+))['"]/i);
+          if (pathMatch) {
+            const failedPath = pathMatch[1];
+            try {
+              const resolved = await resolveOrSearch(failedPath, 'directory');
+              if (resolved.resolved && resolved.resolved !== failedPath) {
+                cwdHint += ` The path "${failedPath}" doesn't exist. Use "${resolved.resolved}" instead.`;
+              } else {
+                // Try as file
+                const fileResolved = await resolveOrSearch(failedPath, 'file');
+                if (fileResolved.resolved && fileResolved.resolved !== failedPath) {
+                  cwdHint += ` The path "${failedPath}" doesn't exist. Use "${fileResolved.resolved}" instead.`;
+                }
+              }
+            } catch { /* resolve failed, skip hint */ }
+          }
           return {
             success: false,
             data: null,
-            error: `Python execution failed: ${msg.slice(0, 1000)}. Fix the script and try again with run_python.`,
+            error: `Python execution failed: ${msg.slice(0, 1000)}.${cwdHint} Fix the script and try again with run_python.`,
           };
         } finally {
           // Clean up temp file
@@ -1023,6 +1083,30 @@ async function execute(
         }
 
         const entries = await fs.readdir(dirPath, { withFileTypes: true });
+        // If there are too many entries (>50), return compact format: just names + type
+        // and add a hint to use open_app or run_python for actions
+        if (entries.length > 50) {
+          const files = entries.filter(e => e.isFile()).map(e => e.name);
+          const dirs = entries.filter(e => e.isDirectory()).map(e => e.name);
+          const compactHint = `Directory has ${entries.length} entries (${files.length} files, ${dirs.length} folders). ` +
+            `Showing names only for compactness. ` +
+            `TIP: To open random files, use open_app(app="${dirPath}", count="N", random="true", filter=".ext") — ` +
+            `it handles selection and opening in one call. ` +
+            `Or use run_python with os.listdir(r"${dirPath}") for custom processing.`;
+          return {
+            success: true,
+            data: {
+              resolvedPath: dirPath,
+              note: (resolveNote || '') + ` [${compactHint}]`,
+              totalFiles: files.length,
+              totalDirs: dirs.length,
+              files: files.slice(0, 100),
+              dirs: dirs.slice(0, 30),
+              ...(files.length > 100 ? { truncatedFiles: true, showing: '100 of ' + files.length } : {}),
+            },
+          };
+        }
+
         const items = [];
         for (const e of entries) {
           try {
@@ -1365,84 +1449,203 @@ async function execute(
       case 'open_app': {
         const app = args.app as string;
         if (!app) return { success: false, data: null, error: 'app is required' };
+        const count = parseInt(args.count as string) || 1;
+        const pickRandom = (args.random as string) === 'true';
+        const filterExts = (args.filter as string)
+          ? (args.filter as string).split(',').map(e => e.trim().toLowerCase().replace(/^\*/, '').replace(/^(?!\.)/, '.'))
+          : null;
 
-        // If it looks like a file/directory path (contains \ or /)
-        const looksLikePath = /[/\\]/.test(app);
+        // Helper: open a file using Python os.startfile
+        async function openFileWithPython(filePath: string): Promise<void> {
+          const pyScript = `import os; os.startfile(r"${filePath.replace(/"/g, '\\"')}")`;
+          const pyTmpFile = path.join(os.tmpdir(), `sandbox_open_${Date.now()}_${Math.random().toString(36).slice(2, 6)}.py`);
+          try {
+            await fs.writeFile(pyTmpFile, pyScript, 'utf-8');
+            await execAsync(`python "${pyTmpFile}"`, { timeout: 10000, windowsHide: true, cwd: DEFAULT_CWD });
+          } finally {
+            await fs.unlink(pyTmpFile).catch(() => {});
+          }
+        }
+
+        // Helper: resolve a path that may not exist exactly (auto-resolve via smartFind)
+        async function resolveDir(dirPath: string): Promise<string | null> {
+          try {
+            const stat = await fs.stat(dirPath);
+            if (stat.isDirectory()) return dirPath;
+          } catch { /* not found */ }
+          // Try auto-resolve
+          const resolved = await resolveOrSearch(dirPath, 'directory');
+          return resolved.resolved;
+        }
+
+        // If it looks like a file/directory path (contains \ or /) OR has directory-mode params
+        const hasDirectoryParams = count > 1 || pickRandom || filterExts;
+        const looksLikePath = /[/\\]/.test(app) || hasDirectoryParams;
         if (looksLikePath) {
-          // First check: is it a directory? → list its contents instead of failing
+          // Step 1: Check if the path exists (or can be resolved)
+          let resolvedPath: string | null = null;
+          let isDir = false;
+          let autoResolveNote: string | null = null;
+
           try {
             const stats = await fs.stat(app);
-            if (stats.isDirectory()) {
-              const entries = await fs.readdir(app, { withFileTypes: true });
-              const fileList = entries.map(e => ({
-                name: e.name,
-                isDirectory: e.isDirectory(),
-                extension: e.isDirectory() ? null : path.extname(e.name).toLowerCase(),
-              }));
+            resolvedPath = app;
+            isDir = stats.isDirectory();
+          } catch {
+            // Path doesn't exist — try to auto-resolve as directory first, then as file
+            const dirResolved = await resolveDir(app);
+            if (dirResolved) {
+              resolvedPath = dirResolved;
+              isDir = true;
+              autoResolveNote = `Auto-resolved "${app}" → "${dirResolved}"`;
+            } else {
+              // Try resolving as a file (maybe it has an extension)
+              const hasExtension = /\.\w{1,10}$/.test(app);
+              if (hasExtension) {
+                const fileResolved = await resolveOrSearch(app, 'file');
+                if (fileResolved.resolved) {
+                  resolvedPath = fileResolved.resolved;
+                  isDir = false;
+                  autoResolveNote = `Auto-resolved "${app}" → "${fileResolved.resolved}"`;
+                }
+              }
+              // Also try the parent directory path as a directory
+              if (!resolvedPath && !hasExtension) {
+                const parentResolved = await resolveDir(path.dirname(app));
+                if (parentResolved) {
+                  // The base name might be a directory inside the resolved parent
+                  const fullCheck = path.join(parentResolved, path.basename(app));
+                  try {
+                    const stat = await fs.stat(fullCheck);
+                    resolvedPath = fullCheck;
+                    isDir = stat.isDirectory();
+                    autoResolveNote = `Auto-resolved "${app}" → "${fullCheck}"`;
+                  } catch { /* still not found */ }
+                }
+              }
+            }
+          }
+
+          if (!resolvedPath) {
+            // Try one last thing: search for directory by name
+            const baseName = path.basename(app);
+            const driveRoot = inferSearchRoot(app);
+            try {
+              const cmd = `dir "${driveRoot}\\" /s /b /ad 2>nul | findstr /i /e "\\\\${baseName}"`;
+              const searchResult = await runCmd(cmd, driveRoot + '\\');
+              const lines = searchResult.stdout.trim().split(/\r?\n/).filter(Boolean);
+              if (lines.length > 0) {
+                resolvedPath = lines[0].trim();
+                isDir = true;
+                autoResolveNote = `Auto-resolved "${app}" → "${resolvedPath}" via drive search`;
+              }
+            } catch { /* nothing found */ }
+          }
+
+          // If still not found and no slashes (plain name like "folderName"), search all drives
+          if (!resolvedPath && !/[/\\]/.test(app)) {
+            try {
+              // Search all drives for a directory with this name
+              const drivesResult = await runPs(
+                'Get-PSDrive -PSProvider FileSystem | Select-Object -ExpandProperty Root',
+              );
+              const drives = drivesResult.stdout.trim().split(/\r?\n/).filter(Boolean);
+              for (const drive of drives) {
+                try {
+                  const cmd = `dir "${drive.trim()}" /s /b /ad 2>nul | findstr /i /e "\\\\${app}"`;
+                  const searchResult = await runCmd(cmd, drive.trim());
+                  const lines = searchResult.stdout.trim().split(/\r?\n/).filter(Boolean);
+                  if (lines.length > 0) {
+                    resolvedPath = lines[0].trim();
+                    isDir = true;
+                    autoResolveNote = `Auto-resolved "${app}" → "${resolvedPath}" via all-drive search`;
+                    break;
+                  }
+                } catch { /* drive search failed, try next */ }
+              }
+            } catch { /* drives query failed */ }
+          }
+
+          if (!resolvedPath) {
+            return { success: false, data: null, error: `Path not found: "${app}". Could not auto-resolve. Use an absolute path or a drive prefix like "E:\\${app}".` };
+          }
+
+          // ── DIRECTORY MODE: list + optional random pick + open ──
+          if (isDir) {
+            const entries = await fs.readdir(resolvedPath, { withFileTypes: true });
+            let files = entries.filter(e => e.isFile());
+            if (filterExts) {
+              files = files.filter(e => filterExts.includes(path.extname(e.name).toLowerCase()));
+            }
+
+            if (files.length === 0) {
               return {
-                success: false,
-                data: { path: app, files: fileList },
-                error: `"${app}" is a directory, not a file. Here are its contents (${fileList.length} items). Pick a specific file to open.`,
+                success: false, data: { resolvedPath, autoResolveNote, totalEntries: entries.length },
+                error: `No matching files in "${resolvedPath}"${filterExts ? ` with extensions ${filterExts.join(', ')}` : ''}. Directory has ${entries.length} total entries.`,
               };
             }
 
-            // It's a file — open it using Python os.startfile (works reliably for all file types on Windows)
-            const ext = path.extname(app).toLowerCase();
+            // Pick files
+            let selected: typeof files;
+            if (pickRandom) {
+              const shuffled = [...files].sort(() => Math.random() - 0.5);
+              selected = shuffled.slice(0, Math.min(count, files.length));
+            } else {
+              selected = files.slice(0, Math.min(count, files.length));
+            }
+
+            // Open each selected file
+            const opened: { name: string; path: string; extension: string; size: string }[] = [];
+            const errors: string[] = [];
+            for (const file of selected) {
+              const fullPath = path.join(resolvedPath, file.name);
+              try {
+                const stat = await fs.stat(fullPath);
+                await openFileWithPython(fullPath);
+                opened.push({
+                  name: file.name,
+                  path: fullPath,
+                  extension: path.extname(file.name).toLowerCase(),
+                  size: stat.size > 1048576 ? `${(stat.size / 1048576).toFixed(2)} MB` : `${(stat.size / 1024).toFixed(2)} KB`,
+                });
+              } catch (err: any) {
+                errors.push(`Failed to open ${file.name}: ${err.message}`);
+              }
+            }
+
+            return {
+              success: opened.length > 0,
+              data: {
+                resolvedPath,
+                autoResolveNote,
+                opened,
+                totalFilesInDir: files.length,
+                ...(errors.length > 0 ? { errors } : {}),
+              },
+            };
+          }
+
+          // ── FILE MODE: open a specific file ──
+          try {
+            const stats = await fs.stat(resolvedPath);
+            const ext = path.extname(resolvedPath).toLowerCase();
             const sizeHuman = stats.size > 1048576
               ? `${(stats.size / 1048576).toFixed(2)} MB`
               : `${(stats.size / 1024).toFixed(2)} KB`;
 
-            const pyScript = `import os; os.startfile(r"${app.replace(/"/g, '\\"')}")`;
-            const pyTmpFile = path.join(os.tmpdir(), `sandbox_open_${Date.now()}.py`);
-            try {
-              await fs.writeFile(pyTmpFile, pyScript, 'utf-8');
-              await execAsync(`python "${pyTmpFile}"`, { timeout: 10000, windowsHide: true });
-            } finally {
-              await fs.unlink(pyTmpFile).catch(() => {});
-            }
-
+            await openFileWithPython(resolvedPath);
             return {
               success: true,
               data: {
-                launched: app,
+                launched: resolvedPath,
                 fileType: ext,
                 size: sizeHuman,
                 isFile: true,
+                ...(autoResolveNote ? { autoResolveNote } : {}),
               },
             };
           } catch (err: any) {
-            if (err.code === 'ENOENT') {
-              // File not found — use resolveOrSearch to find similar files
-              const resolved = await resolveOrSearch(app, 'file');
-              if (resolved.resolved) {
-                // Auto-open the resolved file
-                const ext = path.extname(resolved.resolved).toLowerCase();
-                const pyScript = `import os; os.startfile(r"${resolved.resolved.replace(/"/g, '\\"')}")`;
-                const pyTmpFile = path.join(os.tmpdir(), `sandbox_open_${Date.now()}.py`);
-                try {
-                  await fs.writeFile(pyTmpFile, pyScript, 'utf-8');
-                  await execAsync(`python "${pyTmpFile}"`, { timeout: 10000, windowsHide: true });
-                } finally {
-                  await fs.unlink(pyTmpFile).catch(() => {});
-                }
-                return {
-                  success: true,
-                  data: { launched: resolved.resolved, fileType: ext, autoResolved: resolved.suggestion },
-                };
-              }
-              // Not found and no auto-resolve — list parent directory if it exists
-              const parentDir = path.dirname(app);
-              let parentFiles: string[] = [];
-              try {
-                const entries = await fs.readdir(parentDir);
-                parentFiles = entries.slice(0, 50);
-              } catch { /* parent doesn't exist either */ }
-              const hint = parentFiles.length > 0
-                ? ` Files in "${parentDir}": ${parentFiles.join(', ')}`
-                : resolved.suggestion || '';
-              return { success: false, data: { candidates: resolved.candidates, parentFiles }, error: `File not found: "${app}".${hint}` };
-            }
-            return { success: false, data: null, error: `Cannot open file: ${err.message}` };
+            return { success: false, data: null, error: `Cannot open file "${resolvedPath}": ${err.message}` };
           }
         }
 
