@@ -1110,7 +1110,7 @@ export function ChatInterface() {
       await fetch('/api/files', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: fileName, content: JSON.stringify(session, null, 2) }),
+        body: JSON.stringify({ path: `sessions/${fileName}`, content: JSON.stringify(session, null, 2) }),
       });
       refreshFiles();
     } catch {}
