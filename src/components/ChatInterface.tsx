@@ -12,8 +12,14 @@ import { SessionHistoryViewer } from './SessionHistoryViewer';
 import { SubAgentDisplay, buildHandoff, MAX_SUB_AGENT_RETRIES, type SubAgentRun } from './SubAgentDisplay';
 import { TerminalDisplay, type TerminalStep } from './TerminalDisplay';
 import { ContinuousDisplay, type ContinuousStep, type ContinuousPhase } from './ContinuousDisplay';
+import { WorkflowCanvasModal } from './WorkflowCanvas';
 
 type ChatMode = 'plan' | 'continuous';
+
+interface ActiveWorkflowInfo {
+  plan: { id: string; name: string };
+  continuous: { id: string; name: string };
+}
 
 interface Message {
   role: 'user' | 'assistant';
@@ -49,6 +55,8 @@ export function ChatInterface() {
   const [subAgentRuns, setSubAgentRuns] = useState<SubAgentRun[]>([]);
   const [liveExchanges, setLiveExchanges] = useState<Exchange[]>([]);
   const [chatMode, setChatMode] = useState<ChatMode>('plan');
+  const [activeWorkflowInfo, setActiveWorkflowInfo] = useState<ActiveWorkflowInfo | null>(null);
+  const [showWorkflowEditor, setShowWorkflowEditor] = useState(false);
   const [continuousPhase, setContinuousPhase] = useState<ContinuousPhase>('idle');
   const [continuousPlanSummary, setContinuousPlanSummary] = useState('');
   const [continuousSteps, setContinuousSteps] = useState<ContinuousStep[]>([]);
@@ -74,6 +82,20 @@ export function ChatInterface() {
     fetch('/api/skills')
       .then((r) => r.json())
       .then((data) => setAvailableSkills(data.skills || []))
+      .catch(() => {});
+    // Load active workflow info
+    fetch('/api/workflows')
+      .then((r) => r.json())
+      .then((data) => {
+        const wfs: any[] = data.workflows || [];
+        const active = data.active || { plan: 'default-plan', continuous: 'default-continuous' };
+        const planWf = wfs.find((w: any) => w.id === active.plan);
+        const contWf = wfs.find((w: any) => w.id === active.continuous);
+        setActiveWorkflowInfo({
+          plan: { id: active.plan, name: planWf?.name || active.plan },
+          continuous: { id: active.continuous, name: contWf?.name || active.continuous },
+        });
+      })
       .catch(() => {});
   }, []);
 
@@ -1178,6 +1200,22 @@ export function ChatInterface() {
             <i className="bi bi-lightning-charge-fill me-1"></i>Continuous
           </button>
         </div>
+        {/* ── Active workflow indicator + editor button ── */}
+        <div className="d-flex align-items-center gap-2">
+          {activeWorkflowInfo && (
+            <span className="badge bg-secondary" style={{ fontSize: 11 }} title={`Active ${chatMode} workflow`}>
+              <i className="bi bi-diagram-3 me-1" />
+              {activeWorkflowInfo[chatMode]?.name || 'Default'}
+            </span>
+          )}
+          <button
+            className="btn btn-outline-light btn-sm"
+            onClick={() => setShowWorkflowEditor(true)}
+            title="Open workflow editor"
+          >
+            <i className="bi bi-diagram-3 me-1"></i>Workflows
+          </button>
+        </div>
         <div className="d-flex gap-2">
           <button className="btn btn-outline-light btn-sm" onClick={handleNewFile}>
             <i className="bi bi-file-earmark-plus me-1"></i>New MD
@@ -1504,6 +1542,28 @@ export function ChatInterface() {
           }}
         />
       )}
+
+      {/* ── Workflow Editor Modal ─────────────────────────────── */}
+      <WorkflowCanvasModal
+        open={showWorkflowEditor}
+        onClose={() => setShowWorkflowEditor(false)}
+        initialMode={chatMode}
+        onActiveChange={(act) => {
+          // Refresh active workflow badge
+          fetch('/api/workflows')
+            .then(r => r.json())
+            .then(data => {
+              const wfs: any[] = data.workflows || [];
+              const planWf = wfs.find((w: any) => w.id === act.plan);
+              const contWf = wfs.find((w: any) => w.id === act.continuous);
+              setActiveWorkflowInfo({
+                plan: { id: act.plan, name: planWf?.name || act.plan },
+                continuous: { id: act.continuous, name: contWf?.name || act.continuous },
+              });
+            })
+            .catch(() => {});
+        }}
+      />
     </div>
   );
 }
