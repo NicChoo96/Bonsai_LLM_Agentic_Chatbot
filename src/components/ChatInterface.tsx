@@ -7,14 +7,16 @@ import { FileSelector } from './FileSelector';
 import { MarkdownEditor } from './MarkdownEditor';
 import { ToolCallDisplay } from './ToolCallDisplay';
 import { PlanDisplay, INITIAL_PLAN_STATE, type PlanState } from './PlanDisplay';
-import { ChatSessionPanel, buildExchangeGroups } from './ChatSessionPanel';
+import { ChatSessionPanel, buildExchangeGroups, type Exchange, type ExchangeGroup } from './ChatSessionPanel';
 import { SessionHistoryViewer } from './SessionHistoryViewer';
+import { SubAgentDisplay, buildHandoff, MAX_SUB_AGENT_RETRIES, type SubAgentRun } from './SubAgentDisplay';
 
 interface Message {
   role: 'user' | 'assistant';
   content: string;
   toolCalls?: any[];
   planState?: PlanState;
+  subAgentRuns?: SubAgentRun[];
 }
 
 export function ChatInterface() {
@@ -34,6 +36,8 @@ export function ChatInterface() {
   const [showSessions, setShowSessions] = useState(false);
   const [mainTab, setMainTab] = useState<'chat' | 'history'>('chat');
   const [historyFile, setHistoryFile] = useState<{ path: string; data: any } | null>(null);
+  const [subAgentRuns, setSubAgentRuns] = useState<SubAgentRun[]>([]);
+  const [liveExchanges, setLiveExchanges] = useState<Exchange[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -178,12 +182,192 @@ export function ChatInterface() {
     return data;
   };
 
+  // ── Helper: push live exchanges from a phase result ────────────
+  const pushLiveExchanges = (phase: string, reviewRounds?: { round: number; prompt: string; analysis: string; review_notes?: string }[], extra?: { role: Exchange['role']; label: string; content: string }[]) => {
+    setLiveExchanges(prev => {
+      const newExchanges: Exchange[] = [...prev];
+      if (reviewRounds?.length) {
+        for (const r of reviewRounds) {
+          newExchanges.push({
+            role: 'user',
+            label: r.round === 1 ? `${phase} prompt` : `${phase} review R${r.round}`,
+            content: r.prompt,
+            phase,
+            round: r.round,
+          });
+          newExchanges.push({
+            role: 'assistant',
+            label: r.round === 1 ? `${phase} response` : `${phase} review R${r.round} response`,
+            content: r.analysis,
+            phase,
+            round: r.round,
+          });
+        }
+      }
+      if (extra) {
+        for (const e of extra) {
+          newExchanges.push({ ...e, phase });
+        }
+      }
+      return newExchanges;
+    });
+  };
+
   // ── Abort handler ───────────────────────────────────────────────
   const handleAbort = useCallback(() => {
     abortControllerRef.current?.abort();
   }, []);
 
-  // ── Main send handler (always uses 5-phase plan pipeline) ──────
+  // ── Sub-agent pipeline runner ────────────────────────────────────
+  const runSubAgent = async (
+    handoff: string,
+    attempt: number,
+    signal: AbortSignal,
+    skillsData: { name: string; content: string }[],
+  ): Promise<SubAgentRun> => {
+    const run: SubAgentRun = {
+      attempt,
+      status: 'running',
+      handoff,
+      planState: { ...INITIAL_PLAN_STATE },
+      reply: null,
+      toolCalls: [],
+      error: null,
+    };
+
+    // Payload for sub-agent — uses handoff as the prompt, NO prior messages
+    const basePayload = {
+      userPrompt: handoff,
+      selectedFiles,
+      skills: skillsData,
+    };
+
+    try {
+      // Phase 1: Understand
+      run.planState.currentPhase = 'understand';
+      setSubAgentRuns(prev => {
+        const updated = [...prev];
+        updated[attempt - 1] = { ...run };
+        return updated;
+      });
+
+      const p1 = await callPlanPhase('understand', { ...basePayload, phase: 'understand', messages: [] }, signal);
+      if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      run.planState.understanding = p1.understanding;
+      run.planState.understandingRounds = p1.reviewRounds || [];
+      run.planState.completedPhases = ['understand'];
+
+      // Phase 2: Gather
+      run.planState.currentPhase = 'gather';
+      setSubAgentRuns(prev => {
+        const updated = [...prev];
+        updated[attempt - 1] = { ...run, planState: { ...run.planState } };
+        return updated;
+      });
+
+      const p2 = await callPlanPhase('gather', { ...basePayload, phase: 'gather', messages: [], understanding: p1.understanding }, signal);
+      if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      run.planState.gathered = p2.gathered;
+      run.planState.gatheredRounds = p2.reviewRounds || [];
+      run.planState.completedPhases = ['understand', 'gather'];
+
+      const needsTools = (p2.gathered?.selected_tools?.length > 0);
+
+      if (needsTools) {
+        // Phase 3: Plan
+        run.planState.currentPhase = 'plan';
+        setSubAgentRuns(prev => {
+          const updated = [...prev];
+          updated[attempt - 1] = { ...run, planState: { ...run.planState } };
+          return updated;
+        });
+
+        const p3 = await callPlanPhase('plan', { ...basePayload, phase: 'plan', messages: [] }, signal);
+        if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+        run.planState.plan = p3.plan;
+        run.planState.planRounds = p3.reviewRounds || [];
+        run.planState.review = p3.review || null;
+        run.planState.completedPhases = ['understand', 'gather', 'plan'];
+
+        const finalPlan = p3.review?.corrected_plan || p3.plan;
+        if (p3.review?.corrected_plan) run.planState.plan = p3.review.corrected_plan;
+
+        // Phase 4: Execute
+        run.planState.currentPhase = 'execute';
+        run.planState.executingStep = 0;
+        setSubAgentRuns(prev => {
+          const updated = [...prev];
+          updated[attempt - 1] = { ...run, planState: { ...run.planState } };
+          return updated;
+        });
+
+        // Sub-agent only gets the handoff as context — no main chat history
+        const execMessages = [{ role: 'user', content: handoff }];
+        const p4 = await callPlanPhase('execute', {
+          ...basePayload,
+          phase: 'execute',
+          messages: execMessages,
+          plan: finalPlan,
+        }, signal);
+
+        run.planState.executingStep = (finalPlan?.steps?.length || 1);
+        run.planState.completedPhases = ['understand', 'gather', 'plan', 'execute'];
+        run.planState.currentPhase = null;
+        run.reply = p4.reply;
+        run.toolCalls = p4.toolCalls || [];
+      } else {
+        // No tools — direct response
+        run.planState.completedPhases = ['understand', 'gather', 'plan', 'execute'];
+        run.planState.currentPhase = 'execute';
+        setSubAgentRuns(prev => {
+          const updated = [...prev];
+          updated[attempt - 1] = { ...run, planState: { ...run.planState } };
+          return updated;
+        });
+
+        const execMessages = [{ role: 'user', content: handoff }];
+        const p4 = await callPlanPhase('execute', {
+          ...basePayload,
+          phase: 'execute',
+          messages: execMessages,
+          plan: null,
+          skipTools: true,
+        }, signal);
+
+        run.planState.completedPhases = ['understand', 'gather', 'plan', 'execute'];
+        run.planState.currentPhase = null;
+        run.reply = p4.reply;
+        run.toolCalls = p4.toolCalls || [];
+      }
+
+      // Check if sub-agent also had errors
+      const hasErrors = run.toolCalls.some((tc: any) => tc.status === 'error');
+      const allFailed = run.toolCalls.length > 0 && run.toolCalls.every((tc: any) => tc.status === 'error');
+      run.status = allFailed ? 'error' : 'success';
+      if (allFailed) {
+        run.error = 'All tool calls failed in sub-agent execution';
+      }
+    } catch (err: any) {
+      if (err?.name === 'AbortError' || signal.aborted) {
+        run.status = 'error';
+        run.error = 'Aborted';
+      } else {
+        run.status = 'error';
+        run.error = err.message || 'Sub-agent execution failed';
+      }
+    }
+
+    // Final update
+    setSubAgentRuns(prev => {
+      const updated = [...prev];
+      updated[attempt - 1] = { ...run, planState: { ...run.planState } };
+      return updated;
+    });
+
+    return run;
+  };
+
+  // ── Main send handler (always uses 4-phase plan pipeline) ──────
   const handleSend = async () => {
     const trimmed = input.trim();
     if (!trimmed || loading) return;
@@ -204,6 +388,8 @@ export function ChatInterface() {
     // Reset plan state
     const planState: PlanState = { ...INITIAL_PLAN_STATE };
     setActivePlan({ ...planState });
+    setSubAgentRuns([]);
+    setLiveExchanges([{ role: 'user' as const, label: 'User prompt', content: trimmed, phase: 'input' }]);
 
     // Create abort controller for this pipeline run
     const abortController = new AbortController();
@@ -235,17 +421,23 @@ export function ChatInterface() {
       planState.understanding = p1.understanding;
       planState.understandingRounds = p1.reviewRounds || [];
       planState.completedPhases = ['understand'];
+      pushLiveExchanges('understand', p1.reviewRounds);
 
       // ═══════════ PHASE 2: GATHER TOOLS & SKILLS ════════════
       planState.currentPhase = 'gather';
       setActivePlan({ ...planState });
 
-      const p2 = await callPlanPhase('gather', { ...basePayload, phase: 'gather', messages: [] }, signal);
+      const p2 = await callPlanPhase('gather', { ...basePayload, phase: 'gather', messages: [], understanding: p1.understanding }, signal);
       if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
       planState.gathered = p2.gathered;
       planState.gatheredRounds = p2.reviewRounds || [];
       planState.completedPhases = ['understand', 'gather'];
+      pushLiveExchanges('gather', p2.reviewRounds);
 
+      // ── Check if tools are actually needed ─────────────────
+      const needsTools = (p2.gathered?.selected_tools?.length > 0);
+
+      if (needsTools) {
       // ═══════════ PHASE 3: PLAN + REVIEW (combined) ════════════
       planState.currentPhase = 'plan';
       setActivePlan({ ...planState });
@@ -256,6 +448,7 @@ export function ChatInterface() {
       planState.planRounds = p3.reviewRounds || [];
       planState.review = p3.review || null;
       planState.completedPhases = ['understand', 'gather', 'plan'];
+      pushLiveExchanges('plan', p3.reviewRounds);
 
       // If the review corrected the plan, use the corrected version
       const finalPlanForExecution = p3.review?.corrected_plan || p3.plan;
@@ -282,25 +475,156 @@ export function ChatInterface() {
         plan: finalPlanForExecution,
       }, signal);
 
+      // Push execute exchanges live
+      const execExtra: { role: Exchange['role']; label: string; content: string }[] = [];
+      for (const tc of (p5.toolCalls || [])) {
+        execExtra.push({ role: 'assistant' as const, label: `Tool call: ${tc.name}`, content: JSON.stringify({ tool: tc.name, arguments: tc.arguments }, null, 2) });
+        if (tc.result) execExtra.push({ role: 'tool-result' as const, label: `${tc.name} → ${tc.status}`, content: tc.result });
+      }
+      if (p5.reply) execExtra.push({ role: 'assistant' as const, label: 'Final response', content: p5.reply });
+      pushLiveExchanges('execute', undefined, execExtra);
+
       // Mark all steps done
       planState.executingStep = (finalPlanForExecution?.steps?.length || 1);
       planState.completedPhases = ['understand', 'gather', 'plan', 'execute'];
       planState.currentPhase = null;
 
+      // ── Check for execution errors → spawn sub-agents ──────
+      const failedCalls = (p5.toolCalls || []).filter((tc: any) => tc.status === 'error');
+      const allFailed = p5.toolCalls?.length > 0 && failedCalls.length === p5.toolCalls.length;
+      const successCalls = (p5.toolCalls || []).filter((tc: any) => tc.status === 'success');
+
+      let collectedSubAgentRuns: SubAgentRun[] = [];
+
+      if (allFailed && !signal.aborted) {
+        // Reset sub-agent runs for this prompt
+        setSubAgentRuns([]);
+        collectedSubAgentRuns = [];
+
+        // Build handoff from failed execution
+        const failedSteps = failedCalls.map((tc: any) => ({
+          action: tc.name,
+          tool: tc.name,
+          error: (tc.result || 'Unknown error').slice(0, 200),
+        }));
+        const partialResults = successCalls.map((tc: any) =>
+          `${tc.name}: ${(tc.result || '').slice(0, 100)}`
+        );
+
+        let lastHandoff = buildHandoff(
+          trimmed,
+          finalPlanForExecution?.summary || planState.plan?.summary || null,
+          failedSteps,
+          partialResults,
+        );
+
+        for (let attempt = 1; attempt <= MAX_SUB_AGENT_RETRIES; attempt++) {
+          if (signal.aborted) break;
+
+          // Pre-allocate run slot
+          const placeholder: SubAgentRun = {
+            attempt,
+            status: 'running',
+            handoff: lastHandoff,
+            planState: { ...INITIAL_PLAN_STATE },
+            reply: null,
+            toolCalls: [],
+            error: null,
+          };
+          collectedSubAgentRuns.push(placeholder);
+          setSubAgentRuns([...collectedSubAgentRuns]);
+
+          const result = await runSubAgent(lastHandoff, attempt, signal, skillsData);
+          collectedSubAgentRuns[attempt - 1] = result;
+          setSubAgentRuns([...collectedSubAgentRuns]);
+
+          // If sub-agent succeeded, we're done
+          if (result.status === 'success') break;
+
+          // If sub-agent also failed and we have retries left, build new handoff
+          if (attempt < MAX_SUB_AGENT_RETRIES && result.status === 'error') {
+            const subFailedCalls = result.toolCalls.filter((tc: any) => tc.status === 'error');
+            const subSuccessCalls = result.toolCalls.filter((tc: any) => tc.status === 'success');
+            lastHandoff = buildHandoff(
+              trimmed,
+              result.planState.plan?.summary || null,
+              subFailedCalls.map((tc: any) => ({
+                action: tc.name,
+                tool: tc.name,
+                error: (tc.result || 'Unknown error').slice(0, 200),
+              })),
+              [
+                ...partialResults,
+                ...subSuccessCalls.map((tc: any) => `${tc.name}: ${(tc.result || '').slice(0, 100)}`),
+              ],
+            );
+          }
+        }
+      }
+
       const finalPlan = { ...planState };
       setActivePlan(finalPlan);
+
+      // Use the last successful sub-agent reply if available
+      const lastSuccessfulRun = collectedSubAgentRuns.find(r => r.status === 'success');
+      const finalReply = lastSuccessfulRun?.reply || p5.reply;
+      const finalToolCalls = lastSuccessfulRun?.toolCalls?.length ? lastSuccessfulRun.toolCalls : p5.toolCalls;
 
       setMessages((prev) => [
         ...prev,
         {
           role: 'assistant',
-          content: p5.reply,
-          toolCalls: p5.toolCalls,
+          content: finalReply,
+          toolCalls: finalToolCalls,
           planState: finalPlan,
+          subAgentRuns: collectedSubAgentRuns.length > 0 ? collectedSubAgentRuns : undefined,
         },
       ]);
 
-      if (p5.toolCalls?.length) refreshFiles();
+      if (finalToolCalls?.length) refreshFiles();
+
+      } else {
+        // ═══════════ NO TOOLS NEEDED — DIRECT RESPONSE ═══════
+        planState.completedPhases = ['understand', 'gather', 'plan', 'execute'];
+        planState.currentPhase = 'execute';
+        setActivePlan({ ...planState });
+
+        const execMessages = [...messages, { role: 'user', content: trimmed }].map((m) => ({
+          role: m.role,
+          content: m.content,
+        }));
+
+        const p5 = await callPlanPhase('execute', {
+          ...basePayload,
+          phase: 'execute',
+          messages: execMessages,
+          plan: null,
+          skipTools: true,
+        }, signal);
+
+        // Push direct response exchange live
+        if (p5.reply) {
+          pushLiveExchanges('execute', undefined, [{ role: 'assistant' as const, label: 'Direct response', content: p5.reply }]);
+        }
+
+        planState.completedPhases = ['understand', 'gather', 'plan', 'execute'];
+        planState.currentPhase = null;
+
+        const finalPlan = { ...planState };
+        setActivePlan(finalPlan);
+
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: 'assistant',
+            content: p5.reply,
+            toolCalls: p5.toolCalls,
+            planState: finalPlan,
+          },
+        ]);
+
+        if (p5.toolCalls?.length) refreshFiles();
+      }
     } catch (err: any) {
       const isAbort = err?.name === 'AbortError' || signal.aborted;
       if (isAbort) {
@@ -363,6 +687,7 @@ export function ChatInterface() {
   const handleNewChat = () => {
     setMessages([]);
     setSelectedFiles([]);
+    setSubAgentRuns([]);
   };
 
   const handleNewFile = () => {
@@ -592,13 +917,19 @@ export function ChatInterface() {
                 {msg.toolCalls?.map((tc, j) => (
                   <ToolCallDisplay key={j} toolCall={tc} />
                 ))}
+                {msg.subAgentRuns && msg.subAgentRuns.length > 0 && (
+                  <SubAgentDisplay runs={msg.subAgentRuns} />
+                )}
               </div>
             ))}
 
             {loading && (
               <>
                 <PlanDisplay planState={activePlan} onAbort={handleAbort} />
-                {!activePlan.currentPhase && (
+                {subAgentRuns.length > 0 && (
+                  <SubAgentDisplay runs={subAgentRuns} onAbort={handleAbort} />
+                )}
+                {!activePlan.currentPhase && subAgentRuns.length === 0 && (
                   <div className="d-flex align-items-center gap-2 text-muted ms-2 mb-2">
                     <div className="spinner-border spinner-border-sm" />
                     <span>Thinking…</span>
@@ -690,7 +1021,16 @@ export function ChatInterface() {
 
       {/* ── Chat Session Panel (slide-in from right) ───────────── */}
       <ChatSessionPanel
-        groups={buildExchangeGroups(messages)}
+        groups={[
+          ...buildExchangeGroups(messages),
+          ...(loading && liveExchanges.length > 0
+            ? [{
+                userPrompt: liveExchanges.find(e => e.phase === 'input')?.content || '…',
+                timestamp: Date.now(),
+                exchanges: liveExchanges,
+              } as ExchangeGroup]
+            : []),
+        ]}
         open={showSessions}
         onClose={() => setShowSessions(false)}
       />

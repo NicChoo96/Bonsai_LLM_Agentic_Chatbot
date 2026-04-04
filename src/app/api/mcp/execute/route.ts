@@ -5,6 +5,7 @@ import {
   chromeDevToolsProvider,
   webFetchProvider,
   systemProvider,
+  documentProvider,
   executeTool,
   getAllTools,
 } from '@/lib/mcp';
@@ -14,6 +15,7 @@ registerProvider(filesystemProvider);
 registerProvider(chromeDevToolsProvider);
 registerProvider(webFetchProvider);
 registerProvider(systemProvider);
+registerProvider(documentProvider);
 
 // GET /api/mcp/execute – list all available MCP tools
 export async function GET() {

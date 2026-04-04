@@ -6,7 +6,7 @@ import type { PlanState, ReviewRound } from './PlanDisplay';
 // ─── Types ───────────────────────────────────────────────────────
 
 /** A single message exchange between app and AI */
-interface Exchange {
+export interface Exchange {
   role: 'system' | 'user' | 'assistant' | 'tool-result';
   label: string;
   content: string;
@@ -15,7 +15,7 @@ interface Exchange {
 }
 
 /** Group of exchanges under one user prompt */
-interface ExchangeGroup {
+export interface ExchangeGroup {
   userPrompt: string;
   timestamp: number;
   exchanges: Exchange[];
