@@ -250,6 +250,14 @@ export async function POST(req: NextRequest) {
   }
 }
 
+// ─── Token estimation ────────────────────────────────────────────
+// Rough estimate: ~4 chars per token for English text
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+const MEMORY_MAX_TOKENS = parseInt(process.env.CONTINUOUS_MEMORY_MAX_TOKENS || '3000', 10);
+
 // ─── Memory updater ──────────────────────────────────────────────
 async function updateMemory(
   currentMemory: string,
@@ -280,22 +288,32 @@ async function updateMemory(
     ].join('\n');
   }
 
-  // Ask model to condense memory if getting long (>2000 chars)
   const combined = `${currentMemory}\n\n${newEntry}`;
-  if (combined.length < 2000) {
+  const tokenCount = estimateTokens(combined);
+
+  // Under the limit — no compaction needed
+  if (tokenCount < MEMORY_MAX_TOKENS) {
     return combined;
   }
 
-  // Condense
+  // ── Compact: ask the model to summarise memory down ────────
   const condenseResponse = await sendChatCompletion([
     {
       role: 'system',
       content: [
-        'You are a memory manager. Condense the following session memory into a shorter version.',
-        'Keep: the objective, key findings, current state, important decisions, errors encountered.',
-        'Remove: redundant details, duplicate information, verbose descriptions.',
-        'The latest iteration entry should be kept in full detail.',
-        'Output the condensed memory as markdown. Start with # Session Memory.',
+        'You are a memory manager for an autonomous AI agent.',
+        'The session memory has grown too large and must be compacted.',
+        `TARGET: produce a condensed version that is under ${MEMORY_MAX_TOKENS} tokens (~${MEMORY_MAX_TOKENS * 4} characters).`,
+        '',
+        'Rules:',
+        '1. ALWAYS keep: the objective, current overall status, and key decisions.',
+        '2. ALWAYS keep the LATEST iteration entry in full detail.',
+        '3. Merge older iterations into a brief "Progress so far" summary.',
+        '4. Remove: redundant details, duplicate information, verbose tool output descriptions.',
+        '5. Keep any error notes or blockers that are still relevant.',
+        '6. Output condensed memory as markdown. Start with # Session Memory.',
+        '',
+        'Be aggressive about cutting length while preserving information the agent needs to continue.',
       ].join('\n'),
     },
     {
@@ -304,5 +322,19 @@ async function updateMemory(
     },
   ]);
 
-  return condenseResponse.choices[0]?.message?.content ?? combined;
+  const condensed = condenseResponse.choices[0]?.message?.content ?? combined;
+
+  // Safety check: if condensation still too large, hard-truncate older sections
+  if (estimateTokens(condensed) > MEMORY_MAX_TOKENS) {
+    const lines = condensed.split('\n');
+    let truncated = '';
+    for (const line of lines) {
+      const candidate = truncated + line + '\n';
+      if (estimateTokens(candidate) > MEMORY_MAX_TOKENS) break;
+      truncated = candidate;
+    }
+    return truncated.trimEnd() || condensed.slice(0, MEMORY_MAX_TOKENS * 4);
+  }
+
+  return condensed;
 }

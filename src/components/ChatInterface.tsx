@@ -808,6 +808,15 @@ export function ChatInterface() {
         setContinuousMemory(memory);
         previousSummary = data.summary || '';
 
+        // Persist MEMORY.md to sandbox after each iteration so it's visible
+        if (memory) {
+          fetch('/api/files', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: 'MEMORY.md', content: memory }),
+          }).then(() => refreshFiles()).catch(() => {});
+        }
+
         // Push live exchanges
         pushLiveExchanges(`iter-${iteration}`, undefined, [
           { role: 'user' as const, label: `Iter ${iteration} think prompt`, content: data.thinkPrompt || '' },
@@ -838,11 +847,10 @@ export function ChatInterface() {
       // Save MEMORY.md to sandbox
       if (memory) {
         try {
-          const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
           await fetch('/api/files', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ path: `MEMORY-${ts}.md`, content: memory }),
+            body: JSON.stringify({ path: 'MEMORY.md', content: memory }),
           });
           refreshFiles();
         } catch {}

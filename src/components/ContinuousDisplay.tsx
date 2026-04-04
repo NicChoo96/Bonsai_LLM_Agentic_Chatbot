@@ -226,6 +226,26 @@ function IterationCard({ iteration: iter, isLast }: { iteration: ContinuousItera
         <TerminalDisplay steps={terminalSteps} />
       )}
 
+      {/* AI Reply — shown live as each iteration completes */}
+      {iter.reply && !isRunning && !isError && (
+        <div
+          style={{
+            background: '#1c2128',
+            borderRadius: 4,
+            padding: '6px 10px',
+            marginTop: 4,
+            borderLeft: '3px solid #8b949e',
+          }}
+        >
+          <div style={{ color: '#8b949e', fontSize: '0.7rem', fontWeight: 600, marginBottom: 2 }}>
+            <i className="bi bi-chat-left-text me-1" />RESPONSE
+          </div>
+          <div style={{ color: '#c9d1d9', fontSize: '0.76rem', lineHeight: 1.4, whiteSpace: 'pre-wrap' }}>
+            {iter.reply.length > 600 ? iter.reply.slice(0, 600) + '…' : iter.reply}
+          </div>
+        </div>
+      )}
+
       {/* Summary / Reply */}
       {iter.summary && !isRunning && (
         <div
