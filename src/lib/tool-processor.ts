@@ -386,18 +386,35 @@ export async function runChatWithTools(
     if (options?.beforeExecute && deduped.length > 0) {
       try {
         toExecute = await options.beforeExecute(deduped, allToolCalls);
-        // If review cancelled all calls, treat as if they were skipped
+        // If review cancelled all calls, feed back as errors so the LLM can retry with a different approach
         if (toExecute.length === 0) {
-          const skipMsg = 'Tool calls cancelled by pre-execution review.';
-          allToolCalls.push(...deduped.map(tc => ({
+          const cancelledCalls = deduped.map(tc => ({
             ...tc,
             status: 'error' as const,
-            result: skipMsg,
-          })));
-          return {
-            reply: stripToolCallBlocks(assistantContent) || skipMsg,
-            toolCalls: allToolCalls,
-          };
+            result: (tc as any)._skipReason
+              ? `PRE-EXECUTION REVIEW REJECTED: ${(tc as any)._skipReason}`
+              : 'Tool call rejected by pre-execution review.',
+          }));
+          allToolCalls.push(...cancelledCalls);
+          if (onToolCall) cancelledCalls.forEach(tc => onToolCall(tc));
+
+          // Feed results back to the conversation so the LLM can try a different approach
+          const resultContent = cancelledCalls
+            .map(tc => `[Tool Result: ${tc.name}] (status: ${tc.status})\n${tc.result}`)
+            .join('\n\n');
+          messages.push({ role: 'assistant', content: assistantContent });
+          messages.push({
+            role: 'user',
+            content: [
+              `Tool results:\n\n${resultContent}`,
+              '',
+              '═══ TOOL CALLS REJECTED BY REVIEW ═══',
+              'Your proposed tool calls were rejected. Read the reasons above.',
+              'Try a DIFFERENT approach or fix the arguments and try again.',
+              '═══════════════════════════════════════',
+            ].join('\n'),
+          });
+          continue; // retry the loop instead of returning
         }
       } catch {
         // If review itself fails, proceed with original calls

@@ -711,8 +711,10 @@ export async function POST(req: NextRequest) {
                       result.push(proposed[idx]);
                     } else if (decision.action === 'fix' && decision.fixed_args) {
                       result.push({ ...proposed[idx], arguments: { ...proposed[idx].arguments, ...decision.fixed_args } });
+                    } else if (decision.action === 'skip') {
+                      // Attach skip reason so tool-processor can feed it back to the LLM for retry
+                      (proposed[idx] as any)._skipReason = decision.reason || 'Rejected by review';
                     }
-                    // 'skip' → not added to result
                   }
                   return result;
                 } catch {
