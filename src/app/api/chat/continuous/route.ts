@@ -88,6 +88,14 @@ export async function POST(req: NextRequest) {
           '- For each step, indicate if it likely needs a tool (file I/O, web requests, shell commands, etc.) or can be done directly (text generation, analysis, creative writing).',
           '- If a step involves FINDING or LOCATING a file/folder on the system (not in the sandbox), set "walk_mode": true. Walk mode will progressively search drives and depths until found.',
           '- Be practical — don\'t over-split simple tasks. A single-sentence request may only need 1 step.',
+          '- ALWAYS assign "likely_category" — pick the most appropriate category from the list below.',
+          '',
+          'CATEGORY HINTS:',
+          '- To OPEN/LAUNCH/PLAY a file → "desktop_utils" (has open_app tool)',
+          '- To FIND/SEARCH for files/folders → "search" + walk_mode: true',
+          '- To READ/INSPECT file contents → "host_filesystem"',
+          '- To RUN commands → "shell_exec"',
+          '- NEVER plan to copy host files into the sandbox — that is a security violation.',
           '',
           `Available tool categories:\n${categoryDocs}`,
           '',
@@ -138,8 +146,15 @@ export async function POST(req: NextRequest) {
           '1. Missing steps that are needed to achieve the objective',
           '2. Incorrect ordering or dependencies',
           '3. Unnecessary steps that can be merged or removed',
-          '4. Correct tool category assignments',
+          '4. Correct tool category assignments — EVERY step with needs_tool=true MUST have a likely_category',
           '5. Steps that require finding/locating files or folders on the host system should have "walk_mode": true',
+          '6. SECURITY: No step should copy host files into the sandbox. To open a file, use "desktop_utils" category.',
+          '',
+          'CATEGORY REFERENCE:',
+          '- "desktop_utils" → open/launch/play files or apps (open_app tool)',
+          '- "search" → find/locate files or folders (with walk_mode: true)',
+          '- "host_filesystem" → read/write/inspect files on host',
+          '- "shell_exec" → run shell commands',
           '',
           `Available tool categories:\n${categoryDocs}`,
           '',
@@ -315,31 +330,43 @@ export async function POST(req: NextRequest) {
             const triedCategories: string[] = [];
 
             for (let attempt = 1; attempt <= MAX_STEP_ATTEMPTS; attempt++) {
-              // Resolve category if not yet determined
+              // Resolve category if not yet determined (skip AI call if plan already assigned one)
               if (!categoryId) {
-                const decideSystem = [
-                  'Pick the best tool category for this task step.',
-                  `Available categories:\n${categoryDocs}`,
-                  triedCategories.length > 0 ? `\nAlready tried (DO NOT pick these): [${triedCategories.join(', ')}]` : '',
-                  '',
-                  'Respond with JSON: { "category": "category_id", "reasoning": "brief" }',
-                  'Respond ONLY with valid JSON.',
-                ].filter(Boolean).join('\n');
+                // Auto-detect: if step mentions open/launch/run/play, use desktop_utils directly
+                const openPattern = /\b(open|launch|run|play|start|execute|view)\b.*\b(file|app|application|program|video|image|document|media)\b/i;
+                if (openPattern.test(stepDesc)) {
+                  categoryId = 'desktop_utils';
+                } else {
+                  const decideSystem = [
+                    'Pick the best tool category for this task step.',
+                    `Available categories:\n${categoryDocs}`,
+                    triedCategories.length > 0 ? `\nAlready tried (DO NOT pick these): [${triedCategories.join(', ')}]` : '',
+                    '',
+                    'RULES:',
+                    '- To OPEN/LAUNCH a file or application → pick "desktop_utils" (has open_app)',
+                    '- To FIND/LOCATE/SEARCH for files → pick "search" or use walk_mode',
+                    '- To READ file contents → pick "host_filesystem"',
+                    '- NEVER use host_filesystem to open files for viewing — that is desktop_utils',
+                    '',
+                    'Respond with JSON: { "category": "category_id", "reasoning": "brief" }',
+                    'Respond ONLY with valid JSON.',
+                  ].filter(Boolean).join('\n');
 
-                const decideUser = `STEP: "${stepDesc}"\nOBJECTIVE: "${userPrompt}"`;
-                const decideResponse = await sendChatCompletion([
-                  { role: 'system', content: decideSystem },
-                  { role: 'user', content: decideUser },
-                ]);
-                const decideRaw = decideResponse.choices[0]?.message?.content ?? '{}';
+                  const decideUser = `STEP: "${stepDesc}"\nOBJECTIVE: "${userPrompt}"`;
+                  const decideResponse = await sendChatCompletion([
+                    { role: 'system', content: decideSystem },
+                    { role: 'user', content: decideUser },
+                  ]);
+                  const decideRaw = decideResponse.choices[0]?.message?.content ?? '{}';
 
-                sendEvent('exchange', { phase: `step-${stepIndex}-decide`, role: 'assistant', label: `Step ${stepIndex} category`, content: decideRaw });
+                  sendEvent('exchange', { phase: `step-${stepIndex}-decide`, role: 'assistant', label: `Step ${stepIndex} category`, content: decideRaw });
 
-                try {
-                  const d = JSON.parse(decideRaw);
-                  categoryId = d.category || null;
-                } catch {
-                  categoryId = null;
+                  try {
+                    const d = JSON.parse(decideRaw);
+                    categoryId = d.category || null;
+                  } catch {
+                    categoryId = null;
+                  }
                 }
               }
 
@@ -358,7 +385,13 @@ export async function POST(req: NextRequest) {
                 const selectedCat = categories.find(c => c.id === categoryId);
                 if (selectedCat) catToolNames.push(...selectedCat.toolNames);
               }
+              // Always include sandbox file tools as fallback
               catToolNames.push('sandbox_list_files', 'sandbox_read_file');
+              // If step involves opening/launching, always include open_app + host_file_info
+              if (/\b(open|launch|run|play|start|view)\b/i.test(stepDesc)) {
+                if (!catToolNames.includes('open_app')) catToolNames.push('open_app');
+                if (!catToolNames.includes('host_file_info')) catToolNames.push('host_file_info');
+              }
               const toolPrompt = buildToolSystemPrompt(new Set(catToolNames));
 
               // Use compacted memory as context instead of raw previous results
@@ -377,13 +410,23 @@ export async function POST(req: NextRequest) {
                 memoryContext,
                 retryContext,
                 '',
+                'SECURITY RULES:',
+                '- NEVER copy host files into the sandbox — this is a data breach.',
+                '- NEVER use host_copy to bring external files into the project.',
+                '- To OPEN a file, use open_app with the FULL ABSOLUTE PATH from the host filesystem.',
+                '- Use paths exactly as found by previous steps (from session memory or handoff).',
+                '',
+                'EFFICIENCY:',
+                '- Use the MOST DIRECT tool for the task. Don\'t try multiple approaches if one clearly fits.',
+                '- To open a file → open_app. To read contents → host_read_file. To list files → host_list_dir.',
+                '- Prefer a single tool call over chaining multiple tools when possible.',
+                '',
                 `Sandbox files: [${fileList}]`,
                 bootstrapContext,
                 '',
                 toolPrompt,
                 skillContext,
                 '',
-                'Execute this step. If a tool returns empty results or errors, try alternative tools before concluding.',
                 'When done, provide a clear summary of what was accomplished.',
               ].filter(Boolean).join('\n');
 

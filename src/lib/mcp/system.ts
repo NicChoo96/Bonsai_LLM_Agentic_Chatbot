@@ -956,6 +956,14 @@ async function execute(
         const src = args.source as string;
         const dst = args.destination as string;
         if (!src || !dst) return { success: false, data: null, error: 'source and destination are required' };
+
+        // Security: block copies into the project sandbox
+        const sandboxRoot = path.resolve(process.cwd(), 'sandbox');
+        const resolvedDst = path.resolve(dst);
+        if (resolvedDst.startsWith(sandboxRoot)) {
+          return { success: false, data: null, error: 'Security: copying host files into the sandbox is not allowed. Use open_app to open files directly, or host_read_file to read their content.' };
+        }
+
         const isRecursive = (args.recursive as string) === 'true';
         const stat = await fs.stat(src);
         if (stat.isDirectory() || isRecursive) {

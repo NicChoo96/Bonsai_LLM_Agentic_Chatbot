@@ -56,8 +56,8 @@ export const TOOL_CATEGORIES: ToolCategory[] = [
   {
     id: 'host_filesystem',
     label: 'Host File System',
-    description: 'Read, write, copy, move, delete, and inspect files anywhere on the system (any drive). Includes directory tree view and structured walk.',
-    toolNames: ['host_list_dir', 'host_read_file', 'host_write_file', 'host_copy', 'host_move', 'host_delete', 'host_create_dir', 'host_file_info', 'host_file_exists', 'directory_tree', 'walk_directory'],
+    description: 'Read, write, inspect, and navigate files anywhere on the system (any drive). Includes directory tree view and structured walk. For OPENING files, use desktop_utils category instead.',
+    toolNames: ['host_list_dir', 'host_read_file', 'host_write_file', 'host_move', 'host_delete', 'host_create_dir', 'host_file_info', 'host_file_exists', 'directory_tree', 'walk_directory'],
   },
   {
     id: 'search',
@@ -104,7 +104,7 @@ export const TOOL_CATEGORIES: ToolCategory[] = [
   {
     id: 'desktop_utils',
     label: 'Desktop Utilities',
-    description: 'Clipboard read/write, open URLs in browser, launch applications, environment variables',
+    description: 'OPEN/LAUNCH files and applications. Use open_app to open ANY file (images, videos, documents, executables) with its default program. Also: clipboard read/write, open URLs, environment variables.',
     toolNames: ['clipboard_read', 'clipboard_write', 'open_url', 'open_app', 'env_get', 'env_list'],
   },
   {

@@ -3,3 +3,4 @@ node_modules/
 todo/
 sandbox/
 .env.local
+tsconfig.tsbuildinfo
