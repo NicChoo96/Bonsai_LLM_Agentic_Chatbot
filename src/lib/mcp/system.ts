@@ -52,8 +52,8 @@ const DESTRUCTIVE_PATTERNS = [
   /\btaskkill\b/i,
 ];
 
-/** Maximum output length returned to the model (characters). */
-const MAX_OUTPUT = 16_000;
+/** Maximum output length returned to the model (characters — ~1200 tokens). */
+const MAX_OUTPUT = 4_000;
 /** Command timeout in milliseconds. */
 const CMD_TIMEOUT = 30_000;
 
@@ -442,6 +442,94 @@ const tools: McpToolDefinition[] = [
         file_pattern: { type: 'string', description: 'Optional file glob filter, e.g. "*.ts", "*.log".' },
       },
       required: ['text'],
+    },
+  },
+
+  // ── Navigation: find directories, tree view, glob, walk ────────
+  {
+    name: 'find_directory',
+    description:
+      'FAST directory finder using native Windows "dir /s /b /ad | findstr" (like grep). ' +
+      'Searches all drives by default. Uses multi-pass: exact name → partial match → word-split. ' +
+      'Much faster than PowerShell for filesystem scanning. Returns results instantly as found. ' +
+      'Example: find_directory("folderName") → "L:\\Data\\folderName"',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Directory name or partial name to search for (e.g. "folderName", "Projects").' },
+        start_path: { type: 'string', description: 'Optional starting path to search from (e.g. "D:\\"). Defaults to searching all drives.' },
+        max_results: { type: 'string', description: 'Maximum results to return (default 20).' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'walk_search',
+    description:
+      'Progressive filesystem walker — searches drive-by-drive, depth-by-depth until the target is found. ' +
+      'Like a breadth-first "grep -r" for Windows. Checks shallow levels first (fast), then goes deeper. ' +
+      'Returns as soon as a match is found on any drive. Ideal for finding folders/files when you don\'t know which drive they\'re on. ' +
+      'Example: walk_search("folderName", type="directory") scans C:\\ depth 1, D:\\ depth 1, … then C:\\ depth 2, etc.',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Name or partial name to search for.' },
+        type: { type: 'string', description: '"directory" (default), "file", or "any".' },
+        start_path: { type: 'string', description: 'Optional starting drive/path. If omitted, walks ALL drives.' },
+        max_depth: { type: 'string', description: 'Maximum depth to walk (default 8). Stops early if found.' },
+        max_results: { type: 'string', description: 'Maximum results before stopping (default 10).' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'directory_tree',
+    description:
+      'Show a visual tree structure of a directory (like the "tree" command). ' +
+      'Returns an indented tree showing files and subdirectories. ' +
+      'Great for understanding folder structure before navigating into it. ' +
+      'Example: directory_tree("C:\\Users\\Nic_C\\Documents", depth=2)',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Absolute directory path to show the tree for.' },
+        depth: { type: 'string', description: 'Maximum depth to display (default 3). Use 1 for just immediate children.' },
+        include_files: { type: 'string', description: '"true" to include files (default). "false" for directories only.' },
+        max_entries: { type: 'string', description: 'Maximum total entries to return (default 200). Prevents overwhelming output.' },
+      },
+      required: ['path'],
+    },
+  },
+  {
+    name: 'glob_search',
+    description:
+      'Search for files using glob patterns like Python\'s glob.glob(). ' +
+      'Supports *, ?, and ** (recursive). Examples: "C:\\Users\\**\\*.pdf", "D:\\Data\\*report*.*", "**\\folderName\\*". ' +
+      'More flexible than search_files for complex patterns across deep hierarchies.',
+    parameters: {
+      type: 'object',
+      properties: {
+        pattern: { type: 'string', description: 'Glob pattern (e.g. "C:\\Users\\**\\*.pdf", "D:\\**\\folderName\\*").' },
+        max_results: { type: 'string', description: 'Maximum results to return (default 100).' },
+      },
+      required: ['pattern'],
+    },
+  },
+  {
+    name: 'walk_directory',
+    description:
+      'Walk a directory tree like Python\'s os.walk(). Returns structured results: ' +
+      'for each directory visited, lists its subdirectories and files. ' +
+      'Useful for understanding a folder\'s entire contents and structure programmatically.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Absolute directory path to walk.' },
+        max_depth: { type: 'string', description: 'Maximum depth to walk (default 3).' },
+        file_pattern: { type: 'string', description: 'Optional glob filter for files (e.g. "*.txt"). Default shows all files.' },
+        max_entries: { type: 'string', description: 'Maximum total directory entries to return (default 100).' },
+      },
+      required: ['path'],
     },
   },
 
@@ -1134,6 +1222,380 @@ async function execute(
         if (!app) return { success: false, data: null, error: 'app is required' };
         await runCmd(`start "" "${app}"`);
         return { success: true, data: `Launched: ${app}` };
+      }
+
+      // ── Navigation tools ───────────────────────────────────────
+      case 'find_directory': {
+        const dirName = args.name as string;
+        if (!dirName) return { success: false, data: null, error: 'name is required (directory name to search for)' };
+        const maxResults = parseInt(args.max_results as string) || 20;
+        const startPath = args.start_path as string | undefined;
+
+        // Get list of drives to search
+        let drives: string[] = [];
+        if (startPath) {
+          drives = [startPath.replace(/[/\\]+$/, '')];
+        } else {
+          try {
+            const driveResult = await runPs(
+              "Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Used -ne $null } | Select-Object -ExpandProperty Root"
+            );
+            drives = driveResult.stdout.trim().split(/\r?\n/).filter(Boolean).map(d => d.trim().replace(/[/\\]+$/, ''));
+          } catch {
+            drives = ['C:'];
+          }
+        }
+
+        // PASS 1: Fast native "dir /s /b /ad | findstr /i" — exact name match
+        const allResults: { path: string; name: string; score: number; pass: string }[] = [];
+
+        for (const drive of drives) {
+          if (allResults.length >= maxResults) break;
+          try {
+            const cmd = `dir "${drive}\\" /s /b /ad 2>nul | findstr /i /e "\\\\${dirName}"`;
+            const result = await runCmd(cmd, drive + '\\');
+            const lines = result.stdout.trim().split(/\r?\n/).filter(Boolean);
+            for (const line of lines) {
+              const folderName = path.basename(line.trim());
+              const exactMatch = folderName.toLowerCase() === dirName.toLowerCase();
+              allResults.push({
+                path: line.trim(),
+                name: folderName,
+                score: exactMatch ? 100 : 90,
+                pass: 'exact-findstr',
+              });
+              if (allResults.length >= maxResults) break;
+            }
+          } catch { /* drive may be inaccessible or no results */ }
+        }
+
+        // PASS 2: Partial name match via findstr /i (contains)
+        if (allResults.length === 0) {
+          for (const drive of drives) {
+            if (allResults.length >= maxResults) break;
+            try {
+              const cmd = `dir "${drive}\\" /s /b /ad 2>nul | findstr /i "${dirName}"`;
+              const result = await runCmd(cmd, drive + '\\');
+              const lines = result.stdout.trim().split(/\r?\n/).filter(Boolean);
+              for (const line of lines) {
+                const folderName = path.basename(line.trim());
+                allResults.push({
+                  path: line.trim(),
+                  name: folderName,
+                  score: 70,
+                  pass: 'partial-findstr',
+                });
+                if (allResults.length >= maxResults) break;
+              }
+            } catch { /* continue */ }
+          }
+        }
+
+        // PASS 3: Word-split search — search for each word
+        if (allResults.length === 0) {
+          const words = extractWords(dirName);
+          for (const word of words) {
+            if (allResults.length >= maxResults) break;
+            for (const drive of drives) {
+              if (allResults.length >= maxResults) break;
+              try {
+                const cmd = `dir "${drive}\\" /s /b /ad 2>nul | findstr /i "${word}"`;
+                const result = await runCmd(cmd, drive + '\\');
+                const lines = result.stdout.trim().split(/\r?\n/).filter(Boolean).slice(0, 10);
+                for (const line of lines) {
+                  const folderName = path.basename(line.trim());
+                  allResults.push({
+                    path: line.trim(),
+                    name: folderName,
+                    score: 50,
+                    pass: `word-"${word}"`,
+                  });
+                }
+              } catch { /* continue */ }
+            }
+          }
+        }
+
+        // Sort by score descending
+        allResults.sort((a, b) => b.score - a.score);
+
+        return {
+          success: true,
+          data: {
+            results: allResults.slice(0, maxResults),
+            count: allResults.length,
+            searchedDrives: drives,
+            strategy: allResults.length > 0 ? allResults[0].pass : 'no match',
+            hint: allResults.length === 0
+              ? `No directory matching "${dirName}" found on drives: ${drives.join(', ')}. Check spelling or try a partial name.`
+              : allResults[0].score === 100
+              ? `Exact match found: ${allResults[0].path}`
+              : `Found ${allResults.length} partial matches. Best: ${allResults[0].path} (score ${allResults[0].score})`,
+          },
+        };
+      }
+
+      case 'walk_search': {
+        const searchName = args.name as string;
+        if (!searchName) return { success: false, data: null, error: 'name is required' };
+        const searchType = (args.type as string) || 'directory';
+        const maxDepth = parseInt(args.max_depth as string) || 8;
+        const maxResults = parseInt(args.max_results as string) || 10;
+        const startPath = args.start_path as string | undefined;
+
+        // Get drives
+        let drives: string[] = [];
+        if (startPath) {
+          drives = [startPath.replace(/[/\\]+$/, '')];
+        } else {
+          try {
+            const driveResult = await runPs(
+              "Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Used -ne $null } | Select-Object -ExpandProperty Root"
+            );
+            drives = driveResult.stdout.trim().split(/\r?\n/).filter(Boolean).map(d => d.trim().replace(/[/\\]+$/, ''));
+          } catch {
+            drives = ['C:'];
+          }
+        }
+
+        const dirFlag = searchType === 'directory' ? '/ad' : searchType === 'file' ? '/a-d' : '';
+        const results: { path: string; name: string; drive: string; depth: number; foundAtPass: string }[] = [];
+        const walkedDrives: string[] = [];
+
+        // Progressive walk: depth 0 → 1 → 2 → …, checking all drives at each depth
+        // Like BFS: shallow everywhere first, then deeper
+        for (let depth = 0; depth <= maxDepth; depth++) {
+          if (results.length >= maxResults) break;
+
+          for (const drive of drives) {
+            if (results.length >= maxResults) break;
+
+            // Use native dir to list at specific depth, then grep
+            // For depth control we use PowerShell Get-ChildItem -Depth but via cmd for speed hybrid
+            try {
+              let cmd: string;
+              if (depth === 0) {
+                // Just check the root level
+                cmd = `dir "${drive}\\" /b ${dirFlag} 2>nul | findstr /i "${searchName}"`;
+              } else {
+                // Use PowerShell for depth-limited search (faster than full recursive)
+                const typeFilter = searchType === 'directory' ? '-Directory'
+                  : searchType === 'file' ? '-File'
+                  : '';
+                const psCmd =
+                  `Get-ChildItem -Path '${psEsc(drive)}\\' ${typeFilter} -Depth ${depth} -ErrorAction SilentlyContinue | ` +
+                  `Where-Object { $_.Name -like '*${psEsc(searchName)}*' } | ` +
+                  `Select-Object -First ${maxResults - results.length} -ExpandProperty FullName`;
+                const psResult = await runPs(psCmd);
+                const lines = psResult.stdout.trim().split(/\r?\n/).filter(Boolean);
+                for (const line of lines) {
+                  const itemName = path.basename(line.trim());
+                  // Avoid duplicates
+                  if (!results.some(r => r.path === line.trim())) {
+                    results.push({
+                      path: line.trim(),
+                      name: itemName,
+                      drive,
+                      depth,
+                      foundAtPass: `depth-${depth}`,
+                    });
+                  }
+                }
+                if (!walkedDrives.includes(drive)) walkedDrives.push(drive);
+                continue;
+              }
+
+              const result = await runCmd(cmd, drive + '\\');
+              const lines = result.stdout.trim().split(/\r?\n/).filter(Boolean);
+              for (const line of lines) {
+                results.push({
+                  path: path.join(drive + '\\', line.trim()),
+                  name: line.trim(),
+                  drive,
+                  depth: 0,
+                  foundAtPass: 'depth-0',
+                });
+              }
+              if (!walkedDrives.includes(drive)) walkedDrives.push(drive);
+            } catch { /* drive/depth inaccessible, continue */ }
+          }
+        }
+
+        return {
+          success: true,
+          data: {
+            results: results.slice(0, maxResults),
+            count: results.length,
+            walkedDrives,
+            maxDepthSearched: results.length > 0
+              ? Math.max(...results.map(r => r.depth))
+              : maxDepth,
+            stoppedEarly: results.length >= maxResults,
+            hint: results.length === 0
+              ? `"${searchName}" not found on ${walkedDrives.join(', ')} up to depth ${maxDepth}.`
+              : `Found ${results.length} match(es). First at depth ${results[0].depth}: ${results[0].path}`,
+          },
+        };
+      }
+
+      case 'directory_tree': {
+        const dirPath = args.path as string;
+        if (!dirPath) return { success: false, data: null, error: 'path is required (absolute directory path)' };
+        const maxDepth = parseInt(args.depth as string) || 3;
+        const includeFiles = (args.include_files as string) !== 'false';
+        const maxEntries = parseInt(args.max_entries as string) || 200;
+
+        // Verify directory exists
+        try {
+          const stat = await fs.stat(dirPath);
+          if (!stat.isDirectory()) return { success: false, data: null, error: `"${dirPath}" is not a directory` };
+        } catch {
+          // Try smart resolve
+          const resolved = await resolveOrSearch(dirPath, 'directory');
+          if (!resolved.resolved) {
+            return { success: false, data: null, error: resolved.suggestion || `Directory "${dirPath}" not found` };
+          }
+          // Use resolved path (fall through to tree building)
+        }
+
+        // Build tree using PowerShell
+        const fileFilter = includeFiles ? '' : ' | Where-Object { $_.PSIsContainer }';
+        const psScript =
+          `Get-ChildItem -Path '${psEsc(dirPath)}' -Recurse -Depth ${maxDepth} -ErrorAction SilentlyContinue` +
+          `${fileFilter} | Select-Object -First ${maxEntries} | ForEach-Object { ` +
+          `$rel = $_.FullName.Substring(${dirPath.length}).TrimStart('\\'); ` +
+          `$depth = ($rel -split '\\\\').Count - 1; ` +
+          `$indent = '  ' * $depth; ` +
+          `$icon = if($_.PSIsContainer) { '[D]' } else { '[F]' }; ` +
+          `$size = if(!$_.PSIsContainer -and $_.Length) { ' (' + [math]::Round($_.Length/1KB,1).ToString() + ' KB)' } else { '' }; ` +
+          `"$indent$icon $($_.Name)$size" }`;
+
+        try {
+          const result = await runPs(psScript);
+          const rootName = path.basename(dirPath);
+          const tree = `[D] ${rootName}\n${result.stdout || '  (empty)'}`;
+          const lineCount = tree.split('\n').length;
+
+          return {
+            success: true,
+            data: {
+              tree,
+              path: dirPath,
+              depth: maxDepth,
+              entryCount: lineCount - 1,
+              truncated: lineCount - 1 >= maxEntries,
+            },
+          };
+        } catch (e: any) {
+          return { success: false, data: null, error: `Tree failed: ${e.message}` };
+        }
+      }
+
+      case 'glob_search': {
+        const pattern = args.pattern as string;
+        if (!pattern) return { success: false, data: null, error: 'pattern is required (e.g. "C:\\Users\\**\\*.pdf")' };
+        const maxResults = parseInt(args.max_results as string) || 100;
+
+        // Translate glob to PowerShell — handle ** specially
+        const hasDoublestar = pattern.includes('**');
+        let psScript: string;
+
+        if (hasDoublestar) {
+          // Split at ** to get root and file filter
+          const parts = pattern.split('**');
+          const rootDir = parts[0].replace(/[/\\]+$/, '') || 'C:\\';
+          const fileFilter = (parts[1] || '\\*').replace(/^[/\\]+/, '');
+
+          psScript =
+            `Get-ChildItem -Path '${psEsc(rootDir)}' -Filter '${psEsc(fileFilter.replace(/^[/\\]/, ''))}' ` +
+            `-Recurse -ErrorAction SilentlyContinue | ` +
+            `Select-Object FullName, Name, Length, LastWriteTime, ` +
+            `@{N='Type';E={if($_.PSIsContainer){'Dir'}else{'File'}}} ` +
+            `-First ${maxResults} | ConvertTo-Json`;
+        } else {
+          // Simple glob — use the parent dir + filter
+          const parentDir = path.dirname(pattern);
+          const filter = path.basename(pattern);
+
+          psScript =
+            `Get-ChildItem -Path '${psEsc(parentDir)}' -Filter '${psEsc(filter)}' ` +
+            `-ErrorAction SilentlyContinue | ` +
+            `Select-Object FullName, Name, Length, LastWriteTime, ` +
+            `@{N='Type';E={if($_.PSIsContainer){'Dir'}else{'File'}}} ` +
+            `-First ${maxResults} | ConvertTo-Json`;
+        }
+
+        try {
+          const result = await runPs(psScript);
+          const parsed = JSON.parse(result.stdout || '[]');
+          const items = Array.isArray(parsed) ? parsed : parsed.FullName ? [parsed] : [];
+
+          return {
+            success: true,
+            data: {
+              results: items.map((i: any) => ({
+                path: i.FullName,
+                name: i.Name,
+                size: i.Length,
+                modified: i.LastWriteTime,
+                type: i.Type,
+              })),
+              count: items.length,
+              pattern,
+              truncated: items.length >= maxResults,
+            },
+          };
+        } catch (e: any) {
+          return { success: false, data: null, error: `Glob search failed: ${e.message}` };
+        }
+      }
+
+      case 'walk_directory': {
+        const walkPath = args.path as string;
+        if (!walkPath) return { success: false, data: null, error: 'path is required (absolute directory path)' };
+        const maxDepth = parseInt(args.max_depth as string) || 3;
+        const filePattern = (args.file_pattern as string) || '*';
+        const maxEntries = parseInt(args.max_entries as string) || 100;
+
+        // Use PowerShell to walk the directory structure
+        const psScript =
+          `$result = @(); $count = 0; ` +
+          `Get-ChildItem -Path '${psEsc(walkPath)}' -Directory -Recurse -Depth ${maxDepth} -ErrorAction SilentlyContinue | ` +
+          `ForEach-Object { if($count -ge ${maxEntries}) { return }; $count++; ` +
+          `$dirs = Get-ChildItem -Path $_.FullName -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name; ` +
+          `$files = Get-ChildItem -Path $_.FullName -File -Filter '${psEsc(filePattern)}' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name; ` +
+          `$result += [PSCustomObject]@{ path = $_.FullName; directories = $dirs; files = $files; dirCount = $dirs.Count; fileCount = $files.Count } }; ` +
+          // Also include the root directory itself
+          `$rootDirs = Get-ChildItem -Path '${psEsc(walkPath)}' -Directory -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name; ` +
+          `$rootFiles = Get-ChildItem -Path '${psEsc(walkPath)}' -File -Filter '${psEsc(filePattern)}' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name; ` +
+          `$root = [PSCustomObject]@{ path = '${psEsc(walkPath)}'; directories = $rootDirs; files = $rootFiles; dirCount = $rootDirs.Count; fileCount = $rootFiles.Count }; ` +
+          `@($root) + $result | ConvertTo-Json -Depth 3`;
+
+        try {
+          const result = await runPs(psScript);
+          const parsed = JSON.parse(result.stdout || '[]');
+          const items = Array.isArray(parsed) ? parsed : [parsed];
+
+          return {
+            success: true,
+            data: {
+              entries: items.map((i: any) => ({
+                path: i.path,
+                directories: Array.isArray(i.directories) ? i.directories : i.directories ? [i.directories] : [],
+                files: Array.isArray(i.files) ? i.files : i.files ? [i.files] : [],
+                dirCount: i.dirCount || 0,
+                fileCount: i.fileCount || 0,
+              })),
+              totalDirectories: items.length,
+              rootPath: walkPath,
+              maxDepth,
+              filePattern,
+              truncated: items.length >= maxEntries,
+            },
+          };
+        } catch (e: any) {
+          return { success: false, data: null, error: `Walk failed: ${e.message}` };
+        }
       }
 
       // ── Search files ───────────────────────────────────────────

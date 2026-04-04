@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest } from 'next/server';
 import {
   registerProvider,
   filesystemProvider,
@@ -7,6 +7,7 @@ import {
   systemProvider,
   documentProvider,
   getAllTools,
+  getToolCategories,
 } from '@/lib/mcp';
 import { buildToolSystemPrompt, runChatWithTools, stripToolCallBlocks } from '@/lib/tool-processor';
 import { readSandboxFile, ensureSandbox, listSandboxFiles } from '@/lib/sandbox';
@@ -19,322 +20,569 @@ registerProvider(webFetchProvider);
 registerProvider(systemProvider);
 registerProvider(documentProvider);
 
-// ─── Continuous mode: single-shot iterate ────────────────────────
-// Each call does: elaborate → gather → act → summarize
-// Client calls repeatedly until objective is achieved.
-
-const MAX_TOOL_ITERATIONS = 20;
+// ─── Continuous mode: SSE streaming with step-by-step execution ──
+// Flow: plan (2 rounds) → execute each step (tool or direct) → final answer
+// Each step: decide tool category → select tool → execute → next step
 
 export async function POST(req: NextRequest) {
-  try {
-    const body = await req.json();
-    const {
-      userPrompt,        // The original user objective
-      iteration,         // Current iteration number (1-based)
-      memory,            // Current MEMORY.md content
-      previousSummary,   // Summary from last iteration
-      selectedFiles,
-      skills,
-    } = body as {
-      userPrompt: string;
-      iteration: number;
-      memory: string;
-      previousSummary: string;
-      selectedFiles: string[];
-      skills: { name: string; content: string }[];
-    };
+  const body = await req.json();
+  const {
+    userPrompt,
+    selectedFiles,
+    skills,
+  } = body as {
+    userPrompt: string;
+    selectedFiles: string[];
+    skills: { name: string; content: string }[];
+  };
 
-    await ensureSandbox();
+  await ensureSandbox();
 
-    // ── Shared context ───────────────────────────────────────
-    const sandboxFiles = await listSandboxFiles('');
-    const fileList = sandboxFiles.map((f) => (f.isDirectory ? `${f.path}/` : f.path)).join(', ');
+  // ── Shared context ───────────────────────────────────────
+  const sandboxFiles = await listSandboxFiles('');
+  const fileList = sandboxFiles.map((f) => (f.isDirectory ? `${f.path}/` : f.path)).join(', ');
 
-    let bootstrapContext = '';
-    if (selectedFiles?.length) {
-      const fileContents: string[] = [];
-      for (const filePath of selectedFiles) {
+  let bootstrapContext = '';
+  if (selectedFiles?.length) {
+    const fileContents: string[] = [];
+    for (const filePath of selectedFiles) {
+      try {
+        const content = await readSandboxFile(filePath);
+        fileContents.push(`--- ${filePath} ---\n${content}`);
+      } catch { /* skip unreadable */ }
+    }
+    if (fileContents.length) {
+      bootstrapContext = `\nSelected file contents:\n\n${fileContents.join('\n\n')}`;
+    }
+  }
+
+  const skillContext = (skills || []).length > 0
+    ? `\nLoaded Skills:\n${skills.map((s) => `[Skill: ${s.name}]\n${s.content}`).join('\n---\n')}`
+    : '';
+
+  // Tool categories for category-first selection
+  const categories = getToolCategories();
+  const categoryDocs = categories.map((c) =>
+    `- ${c.id}: ${c.label} — ${c.description} (${c.toolNames.length} tools)`
+  ).join('\n');
+
+  // ── SSE stream ──────────────────────────────────────────
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream({
+    async start(controller) {
+      function sendEvent(event: string, data: any) {
+        const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+        controller.enqueue(encoder.encode(payload));
+      }
+
+      try {
+        // ═══ PHASE 1: CREATE PLAN ═══════════════════════════
+        sendEvent('status', { phase: 'planning', message: 'Creating step-by-step plan...' });
+
+        const planSystem = [
+          'You are a task planner. Break down the user\'s objective into concrete, actionable steps.',
+          '',
+          'RULES:',
+          '- Each step should be a single, focused action.',
+          '- Steps should be in logical order with dependencies respected.',
+          '- For each step, indicate if it likely needs a tool (file I/O, web requests, shell commands, etc.) or can be done directly (text generation, analysis, creative writing).',
+          '- If a step involves FINDING or LOCATING a file/folder on the system (not in the sandbox), set "walk_mode": true. Walk mode will progressively search drives and depths until found.',
+          '- Be practical — don\'t over-split simple tasks. A single-sentence request may only need 1 step.',
+          '',
+          `Available tool categories:\n${categoryDocs}`,
+          '',
+          `Sandbox files: [${fileList}]`,
+          bootstrapContext,
+          skillContext,
+          '',
+          'Respond with JSON:',
+          '{',
+          '  "summary": "brief description of the overall plan",',
+          '  "steps": [',
+          '    { "index": 1, "description": "what to do", "needs_tool": true/false, "likely_category": "category_id or null", "walk_mode": false }',
+          '  ]',
+          '}',
+          'walk_mode should be true ONLY for steps that need to locate/find something on the host filesystem.',
+          'Respond ONLY with valid JSON.',
+        ].filter(Boolean).join('\n');
+
+        const planUser = `OBJECTIVE: "${userPrompt}"`;
+
+        const planResponse = await sendChatCompletion([
+          { role: 'system', content: planSystem },
+          { role: 'user', content: planUser },
+        ]);
+        const planRaw = planResponse.choices[0]?.message?.content ?? '{}';
+
+        let plan: any;
         try {
-          const content = await readSandboxFile(filePath);
-          fileContents.push(`--- ${filePath} ---\n${content}`);
-        } catch { /* skip unreadable files */ }
+          plan = JSON.parse(planRaw);
+        } catch {
+          plan = {
+            summary: 'Execute the task directly',
+            steps: [{ index: 1, description: userPrompt, needs_tool: false, likely_category: null }],
+          };
+        }
+
+        sendEvent('plan', { steps: plan.steps, summary: plan.summary });
+        sendEvent('exchange', { phase: 'plan', role: 'user', label: 'Plan prompt', content: planUser });
+        sendEvent('exchange', { phase: 'plan', role: 'assistant', label: 'Plan response', content: planRaw });
+
+        // ═══ PHASE 2: REVIEW PLAN ══════════════════════════
+        sendEvent('status', { phase: 'reviewing', message: 'Reviewing plan...' });
+
+        const reviewSystem = [
+          'You are a plan reviewer. Review and improve the task plan if needed.',
+          '',
+          'Check for:',
+          '1. Missing steps that are needed to achieve the objective',
+          '2. Incorrect ordering or dependencies',
+          '3. Unnecessary steps that can be merged or removed',
+          '4. Correct tool category assignments',
+          '5. Steps that require finding/locating files or folders on the host system should have "walk_mode": true',
+          '',
+          `Available tool categories:\n${categoryDocs}`,
+          '',
+          'Respond with the FINAL plan as JSON (same format):',
+          '{ "summary": "...", "steps": [ { "index": N, "description": "...", "needs_tool": bool, "likely_category": "...", "walk_mode": bool } ], "changes": "what you changed, or No changes needed" }',
+          'Respond ONLY with valid JSON.',
+        ].join('\n');
+
+        const reviewUser = `OBJECTIVE: "${userPrompt}"\n\nCURRENT PLAN:\n${planRaw}`;
+
+        const reviewResponse = await sendChatCompletion([
+          { role: 'system', content: reviewSystem },
+          { role: 'user', content: reviewUser },
+        ]);
+        const reviewRaw = reviewResponse.choices[0]?.message?.content ?? '{}';
+
+        let reviewed: any;
+        try {
+          reviewed = JSON.parse(reviewRaw);
+        } catch {
+          reviewed = plan;
+        }
+
+        const finalSteps: any[] = reviewed.steps || plan.steps || [];
+        const planSummary = reviewed.summary || plan.summary || '';
+
+        sendEvent('plan_review', {
+          steps: finalSteps,
+          summary: planSummary,
+          changes: reviewed.changes || '',
+        });
+        sendEvent('exchange', { phase: 'review', role: 'user', label: 'Review prompt', content: reviewUser });
+        sendEvent('exchange', { phase: 'review', role: 'assistant', label: 'Review response', content: reviewRaw });
+
+        // ═══ PHASE 3: EXECUTE STEPS (with evaluation + retry + memory compaction) ═══
+        const MAX_STEP_ATTEMPTS = 3;
+        const MEMORY_COMPACT_THRESHOLD = 1500;
+        let memory = `# Session Memory\n**Objective:** ${userPrompt}\n**Plan:** ${planSummary}\n`;
+        const stepResults: { index: number; description: string; result: string; toolCalls: any[] }[] = [];
+
+        for (let i = 0; i < finalSteps.length; i++) {
+          const step = finalSteps[i];
+          const stepIndex = step.index || (i + 1);
+          const stepDesc = step.description || userPrompt;
+
+          sendEvent('step_start', { index: stepIndex, description: stepDesc });
+          sendEvent('status', { phase: 'executing', message: `Step ${stepIndex}/${finalSteps.length}: ${stepDesc}`, stepIndex, totalSteps: finalSteps.length });
+
+          let stepReply = '';
+          let stepToolCalls: any[] = [];
+          let finalStatus = 'complete';
+
+          if (step.walk_mode && step.needs_tool) {
+            // ══ WALK MODE: Progressive filesystem search ══════════
+            // Instead of a single tool call, walk mode iterates:
+            // 1. Try find_directory / walk_search with progressively wider scope
+            // 2. If found, proceed; if not, widen search and retry
+            // 3. Report each walk pass to the UI
+            sendEvent('step_decision', {
+              index: stepIndex,
+              needsTool: true,
+              categories: ['search', 'host_filesystem'],
+              walkMode: true,
+              attempt: 1,
+            });
+
+            const walkTools = new Set([
+              'find_directory', 'walk_search', 'search_files', 'glob_search',
+              'host_list_dir', 'host_file_info', 'host_file_exists',
+              'directory_tree', 'walk_directory', 'list_drives',
+            ]);
+            const walkToolPrompt = buildToolSystemPrompt(walkTools);
+
+            const walkSystem = [
+              `You are executing a WALK MODE step — your job is to FIND something on the filesystem.`,
+              '',
+              `OBJECTIVE: "${userPrompt}"`,
+              `STEP: ${stepDesc}`,
+              memory.length > 100 ? `\nSession memory:\n${memory}` : '',
+              '',
+              'WALK MODE STRATEGY:',
+              '1. First try find_directory or walk_search — these use native Windows "dir | findstr" (like grep) to search fast across all drives.',
+              '2. If that fails, try search_files with different patterns, or glob_search with wildcards.',
+              '3. If found, use directory_tree to explore the found location and confirm it is correct.',
+              '4. NEVER give up after one empty result. Try broader terms, word-split the name, or search different drives.',
+              '5. When you FIND the target, state the full path clearly in your response.',
+              '',
+              `Sandbox files: [${fileList}]`,
+              bootstrapContext,
+              '',
+              walkToolPrompt,
+              '',
+              'Execute this step. Keep searching until you find the target or exhaust all options.',
+            ].filter(Boolean).join('\n');
+
+            const walkMessages: CompletionMessage[] = [
+              { role: 'system', content: walkSystem },
+              { role: 'user', content: `WALK MODE — Find: ${stepDesc}` },
+            ];
+
+            sendEvent('exchange', { phase: `step-${stepIndex}-walk`, role: 'user', label: `Step ${stepIndex} walk mode`, content: walkMessages[1].content });
+
+            const { reply: walkReply, toolCalls: walkCalls } = await runChatWithTools(walkMessages, (tc) => {
+              sendEvent('step_tool_call', { index: stepIndex, toolCall: tc, walkMode: true });
+            });
+
+            stepReply = stripToolCallBlocks(walkReply || '');
+            stepToolCalls = walkCalls;
+
+            sendEvent('exchange', { phase: `step-${stepIndex}-walk`, role: 'assistant', label: `Step ${stepIndex} walk result`, content: stepReply });
+
+            // Evaluate walk result — if not found, do a second wider pass
+            const walkFound = stepReply.toLowerCase().includes('found') ||
+              stepReply.match(/[A-Z]:\\.+/) !== null;
+
+            if (!walkFound && walkCalls.length > 0) {
+              sendEvent('step_retry', {
+                index: stepIndex,
+                attempt: 2,
+                reason: 'Walk mode: target not found, retrying with broader search',
+                newCategory: 'shell_exec',
+              });
+
+              // Second pass: use shell commands directly (like raw dir + findstr)
+              const shellTools = new Set([
+                'run_command', 'run_powershell', 'list_drives',
+                'find_directory', 'walk_search', 'search_files',
+              ]);
+              const shellToolPrompt = buildToolSystemPrompt(shellTools);
+
+              const retrySystem = [
+                `WALK MODE — SECOND PASS. Previous search did NOT find the target.`,
+                '',
+                `OBJECTIVE: "${userPrompt}"`,
+                `STEP: ${stepDesc}`,
+                `Previous attempt found nothing useful.`,
+                '',
+                'TRY THESE STRATEGIES:',
+                '1. Use run_command with: dir "DRIVE:\\" /s /b /ad 2>nul | findstr /i "NAME" — the fastest way to grep for folders on Windows.',
+                '2. Try EACH drive letter separately: C:\\, D:\\, E:\\, etc.',
+                '3. Try partial names, abbreviations, or word-split the target name.',
+                '4. Use list_drives first to see what drives are available.',
+                '5. Use run_powershell: Get-ChildItem -Path DRIVE:\\ -Directory -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "PATTERN" } | Select-Object -First 5 FullName',
+                '',
+                shellToolPrompt,
+                '',
+                'Find it. Report the full path if found.',
+              ].filter(Boolean).join('\n');
+
+              const retryMessages: CompletionMessage[] = [
+                { role: 'system', content: retrySystem },
+                { role: 'user', content: `Second pass — find: ${stepDesc}. Previous tools returned empty. Try direct shell commands on each drive.` },
+              ];
+
+              sendEvent('exchange', { phase: `step-${stepIndex}-walk2`, role: 'user', label: `Step ${stepIndex} walk retry`, content: retryMessages[1].content });
+
+              const { reply: retryReply, toolCalls: retryCalls } = await runChatWithTools(retryMessages, (tc) => {
+                sendEvent('step_tool_call', { index: stepIndex, toolCall: tc, walkMode: true, attempt: 2 });
+              });
+
+              if (retryReply) stepReply = stripToolCallBlocks(retryReply);
+              stepToolCalls.push(...retryCalls);
+
+              sendEvent('exchange', { phase: `step-${stepIndex}-walk2`, role: 'assistant', label: `Step ${stepIndex} walk retry result`, content: stepReply });
+            }
+
+            const allErrors = stepToolCalls.length > 0 && stepToolCalls.every(tc => tc.status === 'error');
+            finalStatus = allErrors ? 'error' : 'complete';
+
+          } else if (step.needs_tool) {
+            // ── Tool-based step with evaluation + cross-category retry ──
+            let categoryId = step.likely_category;
+            const triedCategories: string[] = [];
+
+            for (let attempt = 1; attempt <= MAX_STEP_ATTEMPTS; attempt++) {
+              // Resolve category if not yet determined
+              if (!categoryId) {
+                const decideSystem = [
+                  'Pick the best tool category for this task step.',
+                  `Available categories:\n${categoryDocs}`,
+                  triedCategories.length > 0 ? `\nAlready tried (DO NOT pick these): [${triedCategories.join(', ')}]` : '',
+                  '',
+                  'Respond with JSON: { "category": "category_id", "reasoning": "brief" }',
+                  'Respond ONLY with valid JSON.',
+                ].filter(Boolean).join('\n');
+
+                const decideUser = `STEP: "${stepDesc}"\nOBJECTIVE: "${userPrompt}"`;
+                const decideResponse = await sendChatCompletion([
+                  { role: 'system', content: decideSystem },
+                  { role: 'user', content: decideUser },
+                ]);
+                const decideRaw = decideResponse.choices[0]?.message?.content ?? '{}';
+
+                sendEvent('exchange', { phase: `step-${stepIndex}-decide`, role: 'assistant', label: `Step ${stepIndex} category`, content: decideRaw });
+
+                try {
+                  const d = JSON.parse(decideRaw);
+                  categoryId = d.category || null;
+                } catch {
+                  categoryId = null;
+                }
+              }
+
+              triedCategories.push(categoryId || 'none');
+
+              sendEvent('step_decision', {
+                index: stepIndex,
+                needsTool: true,
+                categories: categoryId ? [categoryId] : [],
+                attempt,
+              });
+
+              // Build filtered tool set from category
+              const catToolNames: string[] = [];
+              if (categoryId) {
+                const selectedCat = categories.find(c => c.id === categoryId);
+                if (selectedCat) catToolNames.push(...selectedCat.toolNames);
+              }
+              catToolNames.push('sandbox_list_files', 'sandbox_read_file');
+              const toolPrompt = buildToolSystemPrompt(new Set(catToolNames));
+
+              // Use compacted memory as context instead of raw previous results
+              const memoryContext = memory.length > 100 ? `\nSession memory:\n${memory}` : '';
+
+              // Retry context from failed attempts
+              const retryContext = attempt > 1
+                ? `\n\n⚠️ PREVIOUS ATTEMPT DID NOT ACHIEVE THE GOAL.\nCategories already tried: [${triedCategories.slice(0, -1).join(', ')}]\nPrevious result was insufficient: ${stepReply.slice(0, 300)}\nYou now have DIFFERENT tools available. Try a completely different approach to achieve the same goal.`
+                : '';
+
+              const execSystem = [
+                `You are executing step ${stepIndex} of a plan.${attempt > 1 ? ` (Attempt ${attempt} — previous approach failed, use the NEW tools)` : ''}`,
+                '',
+                `OBJECTIVE: "${userPrompt}"`,
+                `CURRENT STEP: ${stepDesc}`,
+                memoryContext,
+                retryContext,
+                '',
+                `Sandbox files: [${fileList}]`,
+                bootstrapContext,
+                '',
+                toolPrompt,
+                skillContext,
+                '',
+                'Execute this step. If a tool returns empty results or errors, try alternative tools before concluding.',
+                'When done, provide a clear summary of what was accomplished.',
+              ].filter(Boolean).join('\n');
+
+              const execMessages: CompletionMessage[] = [
+                { role: 'system', content: execSystem },
+                { role: 'user', content: `Execute step ${stepIndex}: ${stepDesc}` },
+              ];
+
+              sendEvent('exchange', { phase: `step-${stepIndex}-a${attempt}`, role: 'user', label: `Step ${stepIndex} exec (attempt ${attempt})`, content: execMessages[1].content });
+
+              const { reply, toolCalls } = await runChatWithTools(execMessages, (tc) => {
+                sendEvent('step_tool_call', { index: stepIndex, toolCall: tc, attempt });
+              });
+
+              stepReply = stripToolCallBlocks(reply || '');
+              stepToolCalls.push(...toolCalls);
+
+              sendEvent('exchange', { phase: `step-${stepIndex}-a${attempt}`, role: 'assistant', label: `Step ${stepIndex} result (attempt ${attempt})`, content: stepReply });
+
+              // ── EVALUATE: Did the step actually achieve its goal? ──
+              if (attempt < MAX_STEP_ATTEMPTS) {
+                const toolSummary = toolCalls.map(tc =>
+                  `${tc.name}(${tc.status}): ${(tc.result || '').slice(0, 200)}`
+                ).join('\n');
+
+                const untriedCats = categories
+                  .filter(c => !triedCategories.includes(c.id))
+                  .map(c => `${c.id}: ${c.label}`)
+                  .join(', ');
+
+                const evalSystem = [
+                  'Evaluate whether this step achieved its objective. Be STRICT:',
+                  '- Empty results (e.g. empty folder, no matches) = NOT satisfied if the data likely exists elsewhere',
+                  '- Tool errors = NOT satisfied',
+                  '- Wrong or incomplete data = NOT satisfied',
+                  '- "Satisfied" ONLY if the step goal is truly accomplished',
+                  '',
+                  untriedCats ? `Untried tool categories that might help: ${untriedCats}` : 'All categories tried.',
+                  '',
+                  'Respond JSON only: { "satisfied": bool, "reason": "1 sentence", "next_category": "category_id or null" }',
+                ].join('\n');
+
+                const evalUser = [
+                  `STEP: "${stepDesc}"`,
+                  `OBJECTIVE: "${userPrompt}"`,
+                  `Tried: [${triedCategories.join(', ')}]`,
+                  `Tool results:\n${toolSummary || 'No tools executed'}`,
+                  `Response: ${stepReply.slice(0, 400)}`,
+                ].join('\n');
+
+                sendEvent('exchange', { phase: `step-${stepIndex}-eval${attempt}`, role: 'user', label: `Step ${stepIndex} evaluate`, content: evalUser });
+
+                const evalResponse = await sendChatCompletion([
+                  { role: 'system', content: evalSystem },
+                  { role: 'user', content: evalUser },
+                ]);
+                const evalRaw = evalResponse.choices[0]?.message?.content ?? '{}';
+
+                sendEvent('exchange', { phase: `step-${stepIndex}-eval${attempt}`, role: 'assistant', label: `Step ${stepIndex} evaluation`, content: evalRaw });
+
+                let evaluation: any;
+                try {
+                  evaluation = JSON.parse(evalRaw);
+                } catch {
+                  evaluation = { satisfied: true }; // parse fail = assume OK
+                }
+
+                if (evaluation.satisfied) break;
+
+                // Not satisfied — check if there's a new category to try
+                const nextCat = evaluation.next_category;
+                if (!nextCat || triedCategories.includes(nextCat)) break; // no new ideas
+
+                categoryId = nextCat;
+                sendEvent('step_retry', {
+                  index: stepIndex,
+                  attempt: attempt + 1,
+                  reason: evaluation.reason || 'Result insufficient',
+                  newCategory: nextCat,
+                });
+              }
+            }
+
+            const allErrors = stepToolCalls.length > 0 && stepToolCalls.every(tc => tc.status === 'error');
+            finalStatus = allErrors ? 'error' : 'complete';
+
+          } else {
+            // ── Direct response step (no tool needed) ────────
+            sendEvent('step_decision', { index: stepIndex, needsTool: false, categories: [] });
+
+            const directSystem = [
+              `You are executing step ${stepIndex} of a plan. No tools are needed.`,
+              '',
+              `OBJECTIVE: "${userPrompt}"`,
+              `CURRENT STEP: ${stepDesc}`,
+              memory.length > 100 ? `\nSession memory:\n${memory}` : '',
+              '',
+              `Sandbox files: [${fileList}]`,
+              bootstrapContext,
+              skillContext,
+              '',
+              'Complete this step with a direct, thorough response.',
+            ].filter(Boolean).join('\n');
+
+            sendEvent('exchange', { phase: `step-${stepIndex}`, role: 'user', label: `Step ${stepIndex} exec`, content: `Complete step ${stepIndex}: ${stepDesc}` });
+
+            const directResponse = await sendChatCompletion([
+              { role: 'system', content: directSystem },
+              { role: 'user', content: `Complete step ${stepIndex}: ${stepDesc}` },
+            ]);
+
+            stepReply = directResponse.choices[0]?.message?.content ?? '';
+            sendEvent('exchange', { phase: `step-${stepIndex}`, role: 'assistant', label: `Step ${stepIndex} result`, content: stepReply });
+          }
+
+          // Record step result
+          stepResults.push({ index: stepIndex, description: stepDesc, result: stepReply, toolCalls: stepToolCalls });
+
+          sendEvent('step_complete', {
+            index: stepIndex,
+            result: stepReply,
+            toolCalls: stepToolCalls,
+            status: finalStatus,
+          });
+
+          // Update memory with step result
+          memory += `\n## Step ${stepIndex}: ${stepDesc}\n`;
+          memory += `Result: ${stepReply.slice(0, 300)}\n`;
+          if (stepToolCalls.length > 0) {
+            memory += `Tools: ${stepToolCalls.map(tc => `${tc.name}(${tc.status})`).join(', ')}\n`;
+          }
+
+          // ── COMPACT MEMORY if too long (keeps token usage low) ──
+          if (memory.length > MEMORY_COMPACT_THRESHOLD) {
+            try {
+              const compactResponse = await sendChatCompletion([
+                { role: 'system', content: 'Compact this session memory into a shorter version. Keep ALL key facts: objective, what was found, what was tried, what succeeded/failed, file paths, important data. Remove verbose descriptions and redundancy. Output clean markdown. Max 800 characters.' },
+                { role: 'user', content: memory },
+              ]);
+              const compacted = compactResponse.choices[0]?.message?.content;
+              if (compacted && compacted.length < memory.length) {
+                memory = compacted;
+              }
+            } catch { /* keep original if compaction fails */ }
+          }
+
+          sendEvent('memory', { content: memory });
+        }
+
+        // ═══ PHASE 4: COMPILE FINAL ANSWER ═════════════════
+        let finalReply: string;
+
+        if (finalSteps.length === 1) {
+          // Single step — its result IS the final answer
+          finalReply = stepResults[0]?.result || 'Task completed.';
+        } else {
+          sendEvent('status', { phase: 'completing', message: 'Compiling final response...' });
+
+          const compileSystem = [
+            'Compile the final response after executing all steps.',
+            'Synthesize results into a clear, comprehensive answer.',
+            '',
+            `OBJECTIVE: "${userPrompt}"`,
+            '',
+            'Step results:',
+            ...stepResults.map(r =>
+              `Step ${r.index} (${r.description}): ${r.result.slice(0, 500)}`
+            ),
+            '',
+            'Provide the final answer. Be thorough but concise.',
+          ].join('\n');
+
+          const compileResponse = await sendChatCompletion([
+            { role: 'system', content: compileSystem },
+            { role: 'user', content: `Compile the final answer for: "${userPrompt}"` },
+          ]);
+          finalReply = compileResponse.choices[0]?.message?.content ?? 'Task completed.';
+
+          sendEvent('exchange', { phase: 'compile', role: 'assistant', label: 'Final compilation', content: finalReply });
+        }
+
+        sendEvent('done', {
+          reply: finalReply,
+          steps: stepResults,
+          memory,
+        });
+      } catch (err: any) {
+        sendEvent('error', { message: err.message || 'Unknown error' });
       }
-      if (fileContents.length) {
-        bootstrapContext = `\nSelected file contents:\n\n${fileContents.join('\n\n')}`;
-      }
-    }
 
-    // All tools available
-    const allTools = getAllTools();
-    const toolPrompt = buildToolSystemPrompt();
-
-    const skillContext = (skills || []).length > 0
-      ? `\nLoaded Skills:\n${skills.map((s) => `[Skill: ${s.name}]\n${s.content}`).join('\n---\n')}`
-      : '';
-
-    // ═══════════ STEP 1: ELABORATE + GATHER + PLAN (single shot) ═══════════
-    const thinkSystem = [
-      'You are an autonomous AI agent working to achieve an objective. You operate in iterative loops.',
-      'Each iteration you: think about what to do next, then act using tools, then report progress.',
-      '',
-      `OBJECTIVE: "${userPrompt}"`,
-      '',
-      memory ? `MEMORY (your persistent notes from previous iterations):\n${memory}\n` : '',
-      previousSummary ? `PREVIOUS ITERATION SUMMARY:\n${previousSummary}\n` : '',
-      `This is iteration ${iteration}.`,
-      '',
-      `Sandbox files: [${fileList}]`,
-      bootstrapContext,
-      '',
-      'Analyze the current state and decide what to do next.',
-      'Respond with JSON:',
-      '{',
-      '  "thinking": "your analysis of current state and what needs to happen next",',
-      '  "tools_needed": ["list", "of", "tool_names"] or [],',
-      '  "next_actions": "describe the concrete actions you will take this iteration",',
-      '  "is_complete": false/true — set true ONLY if the objective is FULLY achieved,',
-      '  "completion_message": "final answer to user if is_complete is true"',
-      '}',
-      'Respond ONLY with valid JSON.',
-    ].filter(Boolean).join('\n');
-
-    const thinkMessages: CompletionMessage[] = [
-      { role: 'system', content: thinkSystem },
-      { role: 'user', content: `Iteration ${iteration}: What should we do next to achieve: "${userPrompt}"` },
-    ];
-
-    const thinkResponse = await sendChatCompletion(thinkMessages);
-    const thinkRaw = thinkResponse.choices[0]?.message?.content ?? '{}';
-
-    let thinking: any;
-    try {
-      thinking = JSON.parse(thinkRaw);
-    } catch {
-      thinking = { thinking: thinkRaw, tools_needed: [], next_actions: thinkRaw, is_complete: false };
-    }
-
-    // If the agent says the objective is complete, return immediately
-    if (thinking.is_complete) {
-      // Update memory with completion
-      const completionMemory = await updateMemory(
-        memory,
-        userPrompt,
-        iteration,
-        thinking.thinking || '',
-        thinking.completion_message || 'Objective achieved.',
-        [],
-      );
-
-      return NextResponse.json({
-        iteration,
-        status: 'complete',
-        thinking: thinking.thinking || '',
-        actions: thinking.next_actions || '',
-        reply: thinking.completion_message || 'Objective achieved.',
-        toolCalls: [],
-        summary: `Completed in ${iteration} iteration(s). ${thinking.completion_message || ''}`,
-        memory: completionMemory,
-        thinkPrompt: thinkSystem,
-        thinkResponse: thinkRaw,
-      });
-    }
-
-    // ═══════════ STEP 2: EXECUTE with tools ════════════════════════
-    const actSystem = [
-      'You are an autonomous AI agent executing actions to achieve an objective.',
-      '',
-      `OBJECTIVE: "${userPrompt}"`,
-      '',
-      `PLAN FOR THIS ITERATION:\n${thinking.next_actions || thinking.thinking || 'Proceed with the task.'}`,
-      '',
-      memory ? `MEMORY:\n${memory}\n` : '',
-      previousSummary ? `PREVIOUS ITERATION RESULT:\n${previousSummary}\n` : '',
-      '',
-      `Sandbox files: [${fileList}]`,
-      bootstrapContext,
-      '',
-      toolPrompt,
-      skillContext,
-      '',
-      'Execute your plan. Use tools as needed. If a tool fails, try a different approach.',
-      'After completing your actions, provide a clear summary of what you accomplished.',
-    ].filter(Boolean).join('\n');
-
-    const actMessages: CompletionMessage[] = [
-      { role: 'system', content: actSystem },
-      { role: 'user', content: `Execute iteration ${iteration} plan: ${thinking.next_actions || 'Proceed with the objective.'}` },
-    ];
-
-    const { reply: actReply, toolCalls } = await runChatWithTools(actMessages);
-
-    // ═══════════ STEP 3: SUMMARIZE this iteration ═════════════════
-    const hasErrors = toolCalls.some(tc => tc.status === 'error');
-    const successCalls = toolCalls.filter(tc => tc.status === 'success');
-    const errorCalls = toolCalls.filter(tc => tc.status === 'error');
-
-    const summarizeSystem = [
-      'Summarize this iteration into a concise paragraph. Include:',
-      '1. What was attempted',
-      '2. What succeeded',
-      '3. What failed (if anything)',
-      '4. What should happen next',
-      '',
-      'Also decide: is the overall objective complete?',
-      '',
-      'Respond with JSON:',
-      '{',
-      '  "summary": "concise paragraph of what happened",',
-      '  "is_complete": true/false,',
-      '  "progress_pct": 0-100 estimate,',
-      '  "next_suggestion": "what the next iteration should do"',
-      '}',
-      'Respond ONLY with valid JSON.',
-    ].join('\n');
-
-    const summarizeUser = [
-      `OBJECTIVE: "${userPrompt}"`,
-      `ITERATION: ${iteration}`,
-      `THINKING: ${thinking.thinking || ''}`,
-      `PLANNED: ${thinking.next_actions || ''}`,
-      `TOOLS CALLED: ${toolCalls.map(tc => `${tc.name}(${tc.status})`).join(', ') || 'none'}`,
-      errorCalls.length > 0 ? `ERRORS: ${errorCalls.map(tc => `${tc.name}: ${(tc.result || '').slice(0, 100)}`).join('; ')}` : '',
-      `AGENT REPLY: ${(actReply || '').slice(0, 500)}`,
-    ].filter(Boolean).join('\n');
-
-    const summarizeResponse = await sendChatCompletion([
-      { role: 'system', content: summarizeSystem },
-      { role: 'user', content: summarizeUser },
-    ]);
-    const summarizeRaw = summarizeResponse.choices[0]?.message?.content ?? '{}';
-
-    let summary: any;
-    try {
-      summary = JSON.parse(summarizeRaw);
-    } catch {
-      summary = { summary: summarizeRaw, is_complete: false, progress_pct: 0, next_suggestion: '' };
-    }
-
-    // ═══════════ STEP 4: UPDATE MEMORY ════════════════════════════
-    const updatedMemory = await updateMemory(
-      memory,
-      userPrompt,
-      iteration,
-      thinking.thinking || '',
-      summary.summary || actReply || '',
-      toolCalls,
-    );
-
-    return NextResponse.json({
-      iteration,
-      status: summary.is_complete ? 'complete' : (hasErrors && successCalls.length === 0 ? 'error' : 'progress'),
-      thinking: thinking.thinking || '',
-      actions: thinking.next_actions || '',
-      reply: stripToolCallBlocks(actReply || ''),
-      toolCalls,
-      summary: summary.summary || '',
-      progressPct: summary.progress_pct || 0,
-      nextSuggestion: summary.next_suggestion || '',
-      isComplete: !!summary.is_complete,
-      memory: updatedMemory,
-      // Exchange data for session panel
-      thinkPrompt: thinkSystem,
-      thinkResponse: thinkRaw,
-      actPrompt: actSystem,
-      actResponse: actReply,
-      summarizePrompt: summarizeSystem,
-      summarizeResponse: summarizeRaw,
-    });
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    return NextResponse.json({ error: message }, { status: 500 });
-  }
-}
-
-// ─── Token estimation ────────────────────────────────────────────
-// Rough estimate: ~4 chars per token for English text
-function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
-}
-
-const MEMORY_MAX_TOKENS = parseInt(process.env.CONTINUOUS_MEMORY_MAX_TOKENS || '3000', 10);
-
-// ─── Memory updater ──────────────────────────────────────────────
-async function updateMemory(
-  currentMemory: string,
-  objective: string,
-  iteration: number,
-  thinking: string,
-  result: string,
-  toolCalls: any[],
-): Promise<string> {
-  const toolSummary = toolCalls.length > 0
-    ? toolCalls.map(tc => `- ${tc.name}: ${tc.status}`).join('\n')
-    : '- No tools used';
-
-  const newEntry = [
-    `## Iteration ${iteration}`,
-    `**Thinking:** ${thinking.slice(0, 200)}`,
-    `**Result:** ${result.slice(0, 300)}`,
-    `**Tools:**\n${toolSummary}`,
-  ].join('\n');
-
-  if (!currentMemory) {
-    return [
-      `# Session Memory`,
-      `**Objective:** ${objective}`,
-      `**Started:** ${new Date().toISOString()}`,
-      '',
-      newEntry,
-    ].join('\n');
-  }
-
-  const combined = `${currentMemory}\n\n${newEntry}`;
-  const tokenCount = estimateTokens(combined);
-
-  // Under the limit — no compaction needed
-  if (tokenCount < MEMORY_MAX_TOKENS) {
-    return combined;
-  }
-
-  // ── Compact: ask the model to summarise memory down ────────
-  const condenseResponse = await sendChatCompletion([
-    {
-      role: 'system',
-      content: [
-        'You are a memory manager for an autonomous AI agent.',
-        'The session memory has grown too large and must be compacted.',
-        `TARGET: produce a condensed version that is under ${MEMORY_MAX_TOKENS} tokens (~${MEMORY_MAX_TOKENS * 4} characters).`,
-        '',
-        'Rules:',
-        '1. ALWAYS keep: the objective, current overall status, and key decisions.',
-        '2. ALWAYS keep the LATEST iteration entry in full detail.',
-        '3. Merge older iterations into a brief "Progress so far" summary.',
-        '4. Remove: redundant details, duplicate information, verbose tool output descriptions.',
-        '5. Keep any error notes or blockers that are still relevant.',
-        '6. Output condensed memory as markdown. Start with # Session Memory.',
-        '',
-        'Be aggressive about cutting length while preserving information the agent needs to continue.',
-      ].join('\n'),
+      controller.close();
     },
-    {
-      role: 'user',
-      content: combined,
+  });
+
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
     },
-  ]);
-
-  const condensed = condenseResponse.choices[0]?.message?.content ?? combined;
-
-  // Safety check: if condensation still too large, hard-truncate older sections
-  if (estimateTokens(condensed) > MEMORY_MAX_TOKENS) {
-    const lines = condensed.split('\n');
-    let truncated = '';
-    for (const line of lines) {
-      const candidate = truncated + line + '\n';
-      if (estimateTokens(candidate) > MEMORY_MAX_TOKENS) break;
-      truncated = candidate;
-    }
-    return truncated.trimEnd() || condensed.slice(0, MEMORY_MAX_TOKENS * 4);
-  }
-
-  return condensed;
+  });
 }

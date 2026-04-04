@@ -1,4 +1,5 @@
-export { registerProvider, getProvider, getAllProviders, getAllTools, executeTool } from './registry';
+export { registerProvider, getProvider, getAllProviders, getAllTools, executeTool, getToolCategories, TOOL_CATEGORIES } from './registry';
+export type { ToolCategory } from './registry';
 export { filesystemProvider } from './filesystem';
 export { chromeDevToolsProvider } from './chrome-devtools';
 export { webFetchProvider } from './web-fetch';

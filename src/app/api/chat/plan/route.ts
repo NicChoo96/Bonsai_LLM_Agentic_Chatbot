@@ -7,6 +7,7 @@ import {
   systemProvider,
   documentProvider,
   getAllTools,
+  getToolCategories,
 } from '@/lib/mcp';
 import { buildToolSystemPrompt, runChatWithTools } from '@/lib/tool-processor';
 import { readSandboxFile, ensureSandbox, listSandboxFiles } from '@/lib/sandbox';
@@ -213,7 +214,7 @@ export async function POST(req: NextRequest) {
     }
 
     // ════════════════════════════════════════════════════════════
-    // PHASE 2: GATHER TOOLS & SKILLS (sub-agent evaluation)
+    // PHASE 2: GATHER TOOLS & SKILLS (category-first evaluation)
     // ════════════════════════════════════════════════════════════
     if (phase === 'gather') {
       const allTools = getAllTools();
@@ -227,7 +228,6 @@ export async function POST(req: NextRequest) {
           .join('; '),
       }));
 
-      // Skills are passed in from the client (already fetched)
       const skillList = (skills || []).map((s) => ({
         name: s.name,
         content: s.content,
@@ -238,67 +238,110 @@ export async function POST(req: NextRequest) {
       const phase1Skills = understanding?.suggested_skills || [];
       const phase1Reasoning = understanding?.tool_skill_reasoning || '';
 
-      // ── Sub-agent: evaluate each tool against the task ──────
-      // Batch tools into groups to keep per-call token usage small
-      const BATCH_SIZE = 6;
-      const toolBatches: typeof toolList[] = [];
-      for (let i = 0; i < toolList.length; i += BATCH_SIZE) {
-        toolBatches.push(toolList.slice(i, i + BATCH_SIZE));
-      }
-
       const gatherRounds: { round: number; prompt: string; analysis: string; review_notes: string }[] = [];
       const approvedTools: string[] = [];
       const toolEvaluations: { name: string; relevant: boolean; reason: string }[] = [];
 
-      for (let batchIdx = 0; batchIdx < toolBatches.length; batchIdx++) {
-        const batch = toolBatches[batchIdx];
-        const batchDocs = batch.map((t) =>
-          `TOOL: ${t.name}\n  Provider: ${t.provider}\n  Description: ${t.description}\n  Parameters: ${t.paramDetails}`
+      // ── Step 1: Category selection (single AI call) ─────────
+      const categories = getToolCategories();
+      const categoryDocs = categories.map((c) =>
+        `- ${c.id}: ${c.label} — ${c.description} (${c.toolNames.length} tools)`
+      ).join('\n');
+
+      const catSystem = [
+        'You are a tool category selector. Given a user task, decide which CATEGORIES of tools might be needed.',
+        '',
+        'CRITICAL RULES:',
+        '- If the task is purely conversational (greetings, creative writing, opinions, general knowledge, brainstorming) → select NO categories. Return empty array [].',
+        '- Only select categories whose capabilities are ACTUALLY needed to accomplish the task.',
+        '- Be selective: fewer categories = faster execution.',
+        '',
+        'Respond with a JSON object:',
+        '  {"categories": ["cat_id", ...], "reasoning": "brief explanation"}',
+        'Respond ONLY with valid JSON.',
+      ].join('\n');
+
+      const catUser = [
+        `USER TASK: "${userPrompt}"`,
+        '',
+        phase1Reasoning ? `Phase 1 analysis: "${phase1Reasoning}"` : '',
+        '',
+        `TOOL CATEGORIES:\n${categoryDocs}`,
+      ].filter(Boolean).join('\n');
+
+      const catResponse = await sendChatCompletion([
+        { role: 'system', content: catSystem },
+        { role: 'user', content: catUser },
+      ]);
+      const catRaw = catResponse.choices[0]?.message?.content ?? '{}';
+
+      gatherRounds.push({
+        round: 1,
+        prompt: catUser,
+        analysis: catRaw,
+        review_notes: 'Category selection',
+      });
+
+      let selectedCategoryIds: string[] = [];
+      try {
+        const parsed = JSON.parse(catRaw);
+        selectedCategoryIds = parsed.categories || [];
+      } catch {
+        // Fallback: if Phase 1 suggested tools, find their categories
+        const toolNameSet = new Set(phase1Tools);
+        selectedCategoryIds = categories
+          .filter(c => c.toolNames.some(t => toolNameSet.has(t)))
+          .map(c => c.id);
+      }
+
+      // ── Step 2: Evaluate tools only within selected categories ──
+      if (selectedCategoryIds.length > 0) {
+        const selectedCategories = categories.filter(c => selectedCategoryIds.includes(c.id));
+        const selectedToolNames = selectedCategories.flatMap(c => c.toolNames);
+        const toolMap = new Map(toolList.map(t => [t.name, t]));
+        const toolsToEvaluate = selectedToolNames
+          .map(name => toolMap.get(name))
+          .filter(Boolean) as typeof toolList;
+
+        const toolDocs = toolsToEvaluate.map((t) =>
+          `TOOL: ${t.name}\n  Category: ${selectedCategories.find(c => c.toolNames.includes(t.name))?.label || 'unknown'}\n  Description: ${t.description}\n  Parameters: ${t.paramDetails}`
         ).join('\n\n');
 
         const evalSystem = [
-          'You are a tool evaluation sub-agent. Your ONLY job is to decide whether each tool below is USEFUL for the given task.',
+          'You are a tool evaluation sub-agent. Decide which of these tools are USEFUL for the given task.',
           '',
-          'CRITICAL RULES:',
-          '- You are evaluating tools that ACTUALLY EXIST and WORK in this system. They are real, functional tools.',
-          '- These tools CAN access the user\'s file system, run commands, fetch web pages, etc. They are NOT hypothetical.',
-          '- Judge each tool based SOLELY on whether the task requires the capability that tool provides.',
-          '- If the task involves finding files → file search tools are relevant.',
-          '- If the task involves running programs → command execution tools are relevant.',
-          '- If the task involves reading/writing files → file I/O tools are relevant.',
-          '- If the task is purely conversational (greetings, jokes, opinions, general knowledge) → no tools needed.',
+          'RULES:',
+          '- These tools are REAL and FUNCTIONAL. They can access the file system, run commands, fetch web pages, etc.',
+          '- Judge each tool based on whether the task requires the capability it provides.',
+          '- Be selective: only mark tools as relevant if they are genuinely needed.',
           '',
-          'For EACH tool, respond with a JSON array of objects:',
+          'Respond with a JSON array:',
           '  [{"name": "tool_name", "relevant": true/false, "reason": "brief reason"}]',
-          '',
-          'Respond ONLY with the JSON array. No other text.',
+          'Respond ONLY with the JSON array.',
         ].join('\n');
 
         const evalUser = [
           `USER TASK: "${userPrompt}"`,
           '',
-          phase1Reasoning ? `Phase 1 analysis said: "${phase1Reasoning}"` : '',
-          phase1Tools.length > 0 ? `Phase 1 suggested these tools: ${phase1Tools.join(', ')}` : '',
+          phase1Reasoning ? `Phase 1 analysis: "${phase1Reasoning}"` : '',
+          phase1Tools.length > 0 ? `Phase 1 suggested tools: ${phase1Tools.join(', ')}` : '',
           '',
-          `TOOLS TO EVALUATE:\n\n${batchDocs}`,
+          `TOOLS TO EVALUATE (from categories: ${selectedCategories.map(c => c.label).join(', ')}):\n\n${toolDocs}`,
         ].filter(Boolean).join('\n');
 
-        const evalMessages: CompletionMessage[] = [
+        const evalResponse = await sendChatCompletion([
           { role: 'system', content: evalSystem },
           { role: 'user', content: evalUser },
-        ];
-
-        const evalResponse = await sendChatCompletion(evalMessages);
+        ]);
         const evalRaw = evalResponse.choices[0]?.message?.content ?? '[]';
 
         gatherRounds.push({
-          round: batchIdx + 1,
+          round: 2,
           prompt: evalUser,
           analysis: evalRaw,
-          review_notes: `Tool evaluation batch ${batchIdx + 1}/${toolBatches.length}`,
+          review_notes: `Tool evaluation (${toolsToEvaluate.length} tools from ${selectedCategories.length} categories)`,
         });
 
-        // Parse evaluations
         try {
           const parsed = JSON.parse(evalRaw);
           if (Array.isArray(parsed)) {
@@ -308,25 +351,36 @@ export async function POST(req: NextRequest) {
                 relevant: !!ev.relevant,
                 reason: ev.reason || '',
               });
-              if (ev.relevant) {
-                approvedTools.push(ev.name);
-              }
+              if (ev.relevant) approvedTools.push(ev.name);
             }
           }
         } catch {
-          // If batch parse fails, fall back to approving Phase 1 suggestions from this batch
-          for (const t of batch) {
+          // Fallback: approve Phase 1 suggestions from selected categories
+          for (const t of toolsToEvaluate) {
             if (phase1Tools.includes(t.name)) {
               approvedTools.push(t.name);
-              toolEvaluations.push({ name: t.name, relevant: true, reason: 'Phase 1 suggested (batch parse failed)' });
+              toolEvaluations.push({ name: t.name, relevant: true, reason: 'Phase 1 suggested (parse failed)' });
             } else {
-              toolEvaluations.push({ name: t.name, relevant: false, reason: 'Not evaluated (batch parse failed)' });
+              toolEvaluations.push({ name: t.name, relevant: false, reason: 'Not evaluated (parse failed)' });
             }
           }
         }
+
+        // Mark non-selected category tools as not evaluated
+        const evaluatedSet = new Set(toolsToEvaluate.map(t => t.name));
+        for (const t of toolList) {
+          if (!evaluatedSet.has(t.name)) {
+            toolEvaluations.push({ name: t.name, relevant: false, reason: 'Category not selected' });
+          }
+        }
+      } else {
+        // No categories selected — mark all tools as not needed
+        for (const t of toolList) {
+          toolEvaluations.push({ name: t.name, relevant: false, reason: 'No tool categories needed for this task' });
+        }
       }
 
-      // ── Evaluate skills (single call if any exist) ──────────
+      // ── Step 3: Evaluate skills (single call if any exist) ──
       const approvedSkills: string[] = [];
       if (skillList.length > 0) {
         const skillDocs = skillList.map((s) =>
@@ -348,7 +402,7 @@ export async function POST(req: NextRequest) {
         const skillRaw = skillResponse.choices[0]?.message?.content ?? '[]';
 
         gatherRounds.push({
-          round: toolBatches.length + 1,
+          round: gatherRounds.length + 1,
           prompt: skillEvalUser,
           analysis: skillRaw,
           review_notes: 'Skill evaluation',
@@ -362,7 +416,6 @@ export async function POST(req: NextRequest) {
             }
           }
         } catch {
-          // If skill parse fails, approve Phase 1 suggestions
           for (const s of skillList) {
             if (phase1Skills.includes(s.name)) approvedSkills.push(s.name);
           }
@@ -373,7 +426,6 @@ export async function POST(req: NextRequest) {
       const selectedTools = [...new Set(approvedTools)];
       const selectedSkills = [...new Set(approvedSkills)];
 
-      // Build reasoning summary
       const reasoningSummary = toolEvaluations
         .filter(e => e.relevant)
         .map(e => `${e.name}: ${e.reason}`)
@@ -382,6 +434,7 @@ export async function POST(req: NextRequest) {
       const gathered = {
         selected_tools: selectedTools,
         selected_skills: selectedSkills,
+        selected_categories: selectedCategoryIds,
         reasoning: reasoningSummary,
         evaluations: toolEvaluations,
       };

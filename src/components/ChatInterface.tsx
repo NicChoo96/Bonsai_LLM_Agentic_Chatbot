@@ -11,10 +11,9 @@ import { ChatSessionPanel, buildExchangeGroups, type Exchange, type ExchangeGrou
 import { SessionHistoryViewer } from './SessionHistoryViewer';
 import { SubAgentDisplay, buildHandoff, MAX_SUB_AGENT_RETRIES, type SubAgentRun } from './SubAgentDisplay';
 import { TerminalDisplay, type TerminalStep } from './TerminalDisplay';
-import { ContinuousDisplay, type ContinuousIteration } from './ContinuousDisplay';
+import { ContinuousDisplay, type ContinuousStep, type ContinuousPhase } from './ContinuousDisplay';
 
 type ChatMode = 'plan' | 'continuous';
-const MAX_CONTINUOUS_ITERATIONS = 15;
 
 interface Message {
   role: 'user' | 'assistant';
@@ -22,8 +21,12 @@ interface Message {
   toolCalls?: any[];
   planState?: PlanState;
   subAgentRuns?: SubAgentRun[];
-  continuousIterations?: ContinuousIteration[];
-  continuousMemory?: string;
+  continuousState?: {
+    phase: ContinuousPhase;
+    planSummary: string;
+    steps: ContinuousStep[];
+    memory: string;
+  };
 }
 
 export function ChatInterface() {
@@ -46,7 +49,10 @@ export function ChatInterface() {
   const [subAgentRuns, setSubAgentRuns] = useState<SubAgentRun[]>([]);
   const [liveExchanges, setLiveExchanges] = useState<Exchange[]>([]);
   const [chatMode, setChatMode] = useState<ChatMode>('plan');
-  const [continuousIterations, setContinuousIterations] = useState<ContinuousIteration[]>([]);
+  const [continuousPhase, setContinuousPhase] = useState<ContinuousPhase>('idle');
+  const [continuousPlanSummary, setContinuousPlanSummary] = useState('');
+  const [continuousSteps, setContinuousSteps] = useState<ContinuousStep[]>([]);
+  const [continuousCurrentStep, setContinuousCurrentStep] = useState(0);
   const [continuousMemory, setContinuousMemory] = useState('');
   const [liveTerminalSteps, setLiveTerminalSteps] = useState<TerminalStep[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -652,8 +658,14 @@ export function ChatInterface() {
 
       } else {
         // ═══════════ NO TOOLS NEEDED — DIRECT RESPONSE ═══════
-        planState.completedPhases = ['understand', 'gather', 'plan', 'execute'];
+        // Set a placeholder plan so PlanDisplay shows a clear "direct response" step
+        planState.plan = {
+          steps: [{ step: 1, action: 'Generate direct response (no tools needed)', tool: 'none', args: null, depends_on: [] }],
+          summary: 'Direct text response — no tools required',
+        };
+        planState.completedPhases = ['understand', 'gather', 'plan'];
         planState.currentPhase = 'execute';
+        planState.executingStep = 0;
         setActivePlan({ ...planState });
 
         const execMessages = [...messages, { role: 'user', content: trimmed }].map((m) => ({
@@ -674,6 +686,7 @@ export function ChatInterface() {
           pushLiveExchanges('execute', undefined, [{ role: 'assistant' as const, label: 'Direct response', content: p5.reply }]);
         }
 
+        planState.executingStep = 1;
         planState.completedPhases = ['understand', 'gather', 'plan', 'execute'];
         planState.currentPhase = null;
 
@@ -717,7 +730,7 @@ export function ChatInterface() {
     }
   };
 
-  // ── Continuous mode handler ─────────────────────────────────────
+  // ── Continuous mode handler (SSE stream) ─────────────────────────
   const handleSendContinuous = async () => {
     const trimmed = input.trim();
     if (!trimmed || loading) return;
@@ -731,7 +744,11 @@ export function ChatInterface() {
     setInput('');
     setLoading(true);
 
-    setContinuousIterations([]);
+    // Reset continuous state
+    setContinuousPhase('idle');
+    setContinuousPlanSummary('');
+    setContinuousSteps([]);
+    setContinuousCurrentStep(0);
     setContinuousMemory('');
     setLiveTerminalSteps([]);
     setLiveExchanges([{ role: 'user' as const, label: 'User prompt', content: trimmed, phase: 'input' }]);
@@ -747,153 +764,253 @@ export function ChatInterface() {
       skillsData = (sd.skills || []).map((s: any) => ({ name: s.name, content: s.content }));
     } catch {}
 
-    let memory = '';
-    let previousSummary = '';
-    const allIterations: ContinuousIteration[] = [];
+    // Track state locally for building the final message
+    let finalMemory = '';
+    let finalSteps: ContinuousStep[] = [];
+    let finalPlanSummary = '';
+    let finalReply = '';
+    let finalPhase: ContinuousPhase = 'idle';
 
     try {
-      for (let iteration = 1; iteration <= MAX_CONTINUOUS_ITERATIONS; iteration++) {
-        if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      const res = await fetch('/api/chat/continuous', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userPrompt: trimmed,
+          selectedFiles,
+          skills: skillsData,
+        }),
+        signal,
+      });
 
-        // Add running placeholder
-        const runningIter: ContinuousIteration = {
-          iteration,
-          status: 'running',
-          thinking: '',
-          actions: '',
-          reply: '',
-          toolCalls: [],
-          summary: '',
-          progressPct: 0,
-          startedAt: Date.now(),
-        };
-        allIterations.push(runningIter);
-        setContinuousIterations([...allIterations]);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: 'Continuous mode failed' }));
+        throw new Error(err.error || 'Continuous mode failed');
+      }
 
-        const res = await fetch('/api/chat/continuous', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            userPrompt: trimmed,
-            iteration,
-            memory,
-            previousSummary,
-            selectedFiles,
-            skills: skillsData,
-          }),
-          signal,
-        });
+      const reader = res.body!.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
 
-        const data = await res.json();
-        if (data.error) throw new Error(data.error);
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
 
-        // Update iteration with results
-        const finishedIter: ContinuousIteration = {
-          iteration,
-          status: data.isComplete ? 'complete' : (data.status === 'error' ? 'error' : 'progress'),
-          thinking: data.thinking || '',
-          actions: data.actions || '',
-          reply: data.reply || '',
-          toolCalls: data.toolCalls || [],
-          summary: data.summary || '',
-          progressPct: data.progressPct || 0,
-          startedAt: runningIter.startedAt,
-          finishedAt: Date.now(),
-        };
-        allIterations[iteration - 1] = finishedIter;
-        setContinuousIterations([...allIterations]);
+        // Parse SSE events from buffer
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
 
-        // Update memory
-        memory = data.memory || memory;
-        setContinuousMemory(memory);
-        previousSummary = data.summary || '';
+        let eventType = '';
+        for (const line of lines) {
+          if (line.startsWith('event: ')) {
+            eventType = line.slice(7).trim();
+          } else if (line.startsWith('data: ') && eventType) {
+            let data: any;
+            try { data = JSON.parse(line.slice(6)); } catch { continue; }
 
-        // Persist MEMORY.md to sandbox after each iteration so it's visible
-        if (memory) {
-          fetch('/api/files', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ path: 'MEMORY.md', content: memory }),
-          }).then(() => refreshFiles()).catch(() => {});
+            switch (eventType) {
+              case 'status': {
+                const phase = data.phase as ContinuousPhase;
+                setContinuousPhase(phase);
+                finalPhase = phase;
+                if (data.stepIndex) setContinuousCurrentStep(data.stepIndex);
+                break;
+              }
+
+              case 'plan': {
+                // Initial plan — populate steps as pending
+                const steps: ContinuousStep[] = (data.steps || []).map((s: any) => ({
+                  index: s.index,
+                  description: s.description || '',
+                  status: 'pending' as const,
+                  needsTool: s.needs_tool,
+                  categories: s.likely_category ? [s.likely_category] : [],
+                  toolCalls: [],
+                }));
+                setContinuousSteps(steps);
+                setContinuousPlanSummary(data.summary || '');
+                finalSteps = steps;
+                finalPlanSummary = data.summary || '';
+                break;
+              }
+
+              case 'plan_review': {
+                // Updated plan after review
+                const steps: ContinuousStep[] = (data.steps || []).map((s: any) => ({
+                  index: s.index,
+                  description: s.description || '',
+                  status: 'pending' as const,
+                  needsTool: s.needs_tool,
+                  categories: s.likely_category ? [s.likely_category] : [],
+                  toolCalls: [],
+                }));
+                setContinuousSteps(steps);
+                setContinuousPlanSummary(data.summary || '');
+                finalSteps = steps;
+                finalPlanSummary = data.summary || '';
+                break;
+              }
+
+              case 'step_start': {
+                const idx = data.index;
+                setContinuousCurrentStep(idx);
+                setContinuousSteps(prev => prev.map(s =>
+                  s.index === idx ? { ...s, status: 'executing' as const, startedAt: Date.now() } : s
+                ));
+                finalSteps = finalSteps.map(s =>
+                  s.index === idx ? { ...s, status: 'executing' as const, startedAt: Date.now() } : s
+                );
+                break;
+              }
+
+              case 'step_decision': {
+                const idx = data.index;
+                setContinuousSteps(prev => prev.map(s =>
+                  s.index === idx ? { ...s, needsTool: data.needsTool, categories: data.categories || [], attempt: data.attempt || s.attempt, walkMode: data.walkMode || s.walkMode } : s
+                ));
+                finalSteps = finalSteps.map(s =>
+                  s.index === idx ? { ...s, needsTool: data.needsTool, categories: data.categories || [], attempt: data.attempt || s.attempt, walkMode: data.walkMode || s.walkMode } : s
+                );
+                break;
+              }
+
+              case 'step_retry': {
+                const idx = data.index;
+                setContinuousSteps(prev => prev.map(s =>
+                  s.index === idx ? { ...s, attempt: data.attempt, retryReason: data.reason, categories: data.newCategory ? [data.newCategory] : s.categories } : s
+                ));
+                finalSteps = finalSteps.map(s =>
+                  s.index === idx ? { ...s, attempt: data.attempt, retryReason: data.reason, categories: data.newCategory ? [data.newCategory] : s.categories } : s
+                );
+                break;
+              }
+
+              case 'step_tool_call': {
+                const idx = data.index;
+                const tc = data.toolCall;
+                // Live terminal update
+                setLiveTerminalSteps(prev => [...prev, {
+                  stepIndex: prev.length,
+                  action: tc.name,
+                  toolName: tc.name,
+                  args: typeof tc.arguments === 'string' ? JSON.parse(tc.arguments || '{}') : (tc.arguments || {}),
+                  status: tc.status || 'success',
+                  result: tc.result,
+                  startedAt: Date.now(),
+                }]);
+                // Update step's tool calls
+                setContinuousSteps(prev => prev.map(s =>
+                  s.index === idx ? { ...s, toolCalls: [...s.toolCalls, tc] } : s
+                ));
+                finalSteps = finalSteps.map(s =>
+                  s.index === idx ? { ...s, toolCalls: [...s.toolCalls, tc] } : s
+                );
+                break;
+              }
+
+              case 'step_complete': {
+                const idx = data.index;
+                const now = Date.now();
+                setContinuousSteps(prev => prev.map(s =>
+                  s.index === idx ? {
+                    ...s,
+                    status: (data.status === 'error' ? 'error' : 'complete') as ContinuousStep['status'],
+                    result: data.result,
+                    toolCalls: data.toolCalls || s.toolCalls,
+                    finishedAt: now,
+                  } : s
+                ));
+                finalSteps = finalSteps.map(s =>
+                  s.index === idx ? {
+                    ...s,
+                    status: (data.status === 'error' ? 'error' : 'complete') as ContinuousStep['status'],
+                    result: data.result,
+                    toolCalls: data.toolCalls || s.toolCalls,
+                    finishedAt: now,
+                  } : s
+                );
+                break;
+              }
+
+              case 'exchange': {
+                // Push to live session exchanges
+                pushLiveExchanges(data.phase || 'continuous', undefined, [{
+                  role: data.role === 'user' ? 'user' as const : 'assistant' as const,
+                  label: data.label || `${data.phase} ${data.role}`,
+                  content: data.content || '',
+                }]);
+                break;
+              }
+
+              case 'memory': {
+                const mem = data.content || '';
+                setContinuousMemory(mem);
+                finalMemory = mem;
+                // Save MEMORY.md to sandbox
+                if (mem) {
+                  fetch('/api/files', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path: 'MEMORY.md', content: mem }),
+                  }).then(() => refreshFiles()).catch(() => {});
+                }
+                break;
+              }
+
+              case 'done': {
+                finalReply = data.reply || '';
+                finalPhase = 'complete';
+                setContinuousPhase('complete');
+                break;
+              }
+
+              case 'error': {
+                throw new Error(data.message || 'Continuous mode error');
+              }
+            }
+            eventType = '';
+          }
         }
-
-        // Push live exchanges
-        pushLiveExchanges(`iter-${iteration}`, undefined, [
-          { role: 'user' as const, label: `Iter ${iteration} think prompt`, content: data.thinkPrompt || '' },
-          { role: 'assistant' as const, label: `Iter ${iteration} think response`, content: data.thinkResponse || '' },
-          ...(data.actPrompt ? [{ role: 'user' as const, label: `Iter ${iteration} act prompt`, content: data.actPrompt }] : []),
-          ...(data.actResponse ? [{ role: 'assistant' as const, label: `Iter ${iteration} act response`, content: data.actResponse }] : []),
-        ]);
-
-        // Update live terminal steps from this iteration
-        const iterSteps: TerminalStep[] = (data.toolCalls || []).map((tc: any, i: number) => ({
-          stepIndex: liveTerminalSteps.length + i,
-          action: tc.name,
-          toolName: tc.name,
-          args: tc.arguments || {},
-          status: tc.status || 'success',
-          result: tc.result,
-          startedAt: runningIter.startedAt,
-          finishedAt: Date.now(),
-        }));
-        setLiveTerminalSteps(prev => [...prev, ...iterSteps]);
-
-        // Check if done
-        if (data.isComplete || data.status === 'complete') break;
-
-        // If all tools errored, still continue (the model will adapt) — unless max retries
       }
-
-      // Save MEMORY.md to sandbox
-      if (memory) {
-        try {
-          await fetch('/api/files', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ path: 'MEMORY.md', content: memory }),
-          });
-          refreshFiles();
-        } catch {}
-      }
-
-      const lastIter = allIterations[allIterations.length - 1];
-      const finalReply = lastIter?.reply || lastIter?.summary || 'Continuous execution complete.';
 
       setMessages((prev) => [
         ...prev,
         {
           role: 'assistant',
-          content: finalReply,
-          toolCalls: allIterations.flatMap(i => i.toolCalls || []),
-          continuousIterations: [...allIterations],
-          continuousMemory: memory,
+          content: finalReply || 'Continuous execution complete.',
+          toolCalls: finalSteps.flatMap(s => s.toolCalls || []),
+          continuousState: {
+            phase: 'complete',
+            planSummary: finalPlanSummary,
+            steps: finalSteps,
+            memory: finalMemory,
+          },
         },
       ]);
 
       refreshFiles();
     } catch (err: any) {
       const isAbort = err?.name === 'AbortError' || signal.aborted;
-      if (isAbort) {
-        setMessages((prev) => [
-          ...prev,
-          {
-            role: 'assistant',
-            content: 'Continuous execution aborted.',
-            continuousIterations: [...allIterations],
-            continuousMemory: memory,
+      const errContent = isAbort
+        ? 'Continuous execution aborted.'
+        : `Continuous mode error: ${err.message || 'Unknown error'}`;
+
+      setContinuousPhase(isAbort ? 'idle' : 'error');
+
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: 'assistant',
+          content: errContent,
+          continuousState: {
+            phase: isAbort ? 'idle' : 'error',
+            planSummary: finalPlanSummary,
+            steps: finalSteps,
+            memory: finalMemory,
           },
-        ]);
-      } else {
-        setMessages((prev) => [
-          ...prev,
-          {
-            role: 'assistant',
-            content: `Continuous mode error: ${err.message || 'Unknown error'}`,
-            continuousIterations: [...allIterations],
-            continuousMemory: memory,
-          },
-        ]);
-      }
+        },
+      ]);
     } finally {
       abortControllerRef.current = null;
       setLoading(false);
@@ -1192,15 +1309,18 @@ export function ChatInterface() {
               <div key={i}>
                 <MessageBubble role={msg.role} content={msg.content} />
                 {msg.planState && <PlanDisplay planState={msg.planState} />}
-                {/* Continuous mode: show iterations display */}
-                {msg.continuousIterations && msg.continuousIterations.length > 0 && (
+                {/* Continuous mode: show steps display */}
+                {msg.continuousState && msg.continuousState.steps.length > 0 && (
                   <ContinuousDisplay
-                    iterations={msg.continuousIterations}
-                    memory={msg.continuousMemory || ''}
+                    phase={msg.continuousState.phase}
+                    planSummary={msg.continuousState.planSummary}
+                    steps={msg.continuousState.steps}
+                    currentStepIndex={0}
+                    memory={msg.continuousState.memory || ''}
                   />
                 )}
                 {/* Plan mode: show terminal for tool calls */}
-                {msg.toolCalls && msg.toolCalls.length > 0 && !msg.continuousIterations && (
+                {msg.toolCalls && msg.toolCalls.length > 0 && !msg.continuousState && (
                   <TerminalDisplay
                     steps={msg.toolCalls.map((tc: any, j: number) => ({
                       stepIndex: j,
@@ -1241,7 +1361,10 @@ export function ChatInterface() {
                 {/* Continuous mode loading */}
                 {chatMode === 'continuous' && (
                   <ContinuousDisplay
-                    iterations={continuousIterations}
+                    phase={continuousPhase}
+                    planSummary={continuousPlanSummary}
+                    steps={continuousSteps}
+                    currentStepIndex={continuousCurrentStep}
                     memory={continuousMemory}
                     onAbort={handleAbort}
                   />

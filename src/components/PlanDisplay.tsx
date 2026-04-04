@@ -43,6 +43,7 @@ export interface PlanState {
   gathered: {
     selected_tools: string[];
     selected_skills: string[];
+    selected_categories?: string[];
     reasoning: string;
   } | null;
   /** Phase 2 review rounds */
@@ -386,6 +387,16 @@ export function PlanDisplay({ planState, onAbort }: PlanDisplayProps) {
               </small>
             </div>
             <p className="mb-1 text-muted" style={{ fontSize: '0.82rem' }}>{gathered.reasoning}</p>
+            {gathered.selected_categories && gathered.selected_categories.length > 0 && (
+              <div className="d-flex flex-wrap gap-1 mt-1 mb-1">
+                <small className="text-muted fw-semibold me-1" style={{ fontSize: '0.72rem' }}>Categories:</small>
+                {gathered.selected_categories.map((c) => (
+                  <span key={c} className="badge bg-secondary bg-opacity-25 text-dark" style={{ fontSize: '0.72rem' }}>
+                    <i className="bi bi-folder me-1"></i>{c}
+                  </span>
+                ))}
+              </div>
+            )}
             <div className="d-flex flex-wrap gap-1 mt-1">
               {gathered.selected_tools.map((t) => (
                 <span key={t} className="badge bg-info text-dark">{t}</span>

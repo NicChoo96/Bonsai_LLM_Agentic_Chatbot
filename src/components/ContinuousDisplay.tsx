@@ -4,37 +4,54 @@ import React, { useState } from 'react';
 import { TerminalDisplay, type TerminalStep } from './TerminalDisplay';
 
 // ─── Types ───────────────────────────────────────────────────────
-export interface ContinuousIteration {
-  iteration: number;
-  status: 'running' | 'progress' | 'complete' | 'error';
-  thinking: string;
-  actions: string;
-  reply: string;
+export interface ContinuousStep {
+  index: number;
+  description: string;
+  status: 'pending' | 'deciding' | 'executing' | 'complete' | 'error';
+  needsTool?: boolean;
+  categories?: string[];
   toolCalls: any[];
-  summary: string;
-  progressPct: number;
-  startedAt: number;
+  result?: string;
+  startedAt?: number;
   finishedAt?: number;
+  attempt?: number;
+  retryReason?: string;
+  walkMode?: boolean;
 }
 
+export type ContinuousPhase = 'idle' | 'planning' | 'reviewing' | 'executing' | 'completing' | 'complete' | 'error';
+
 interface ContinuousDisplayProps {
-  iterations: ContinuousIteration[];
+  phase: ContinuousPhase;
+  planSummary: string;
+  steps: ContinuousStep[];
+  currentStepIndex: number;
   memory: string;
   onAbort?: () => void;
 }
 
 // ─── Component ───────────────────────────────────────────────────
-export function ContinuousDisplay({ iterations, memory, onAbort }: ContinuousDisplayProps) {
+export function ContinuousDisplay({ phase, planSummary, steps, currentStepIndex, memory, onAbort }: ContinuousDisplayProps) {
   const [showMemory, setShowMemory] = useState(false);
+  const [expandedStep, setExpandedStep] = useState<number | null>(null);
 
-  if (iterations.length === 0) return null;
+  if (phase === 'idle' && steps.length === 0) return null;
 
-  const current = iterations[iterations.length - 1];
-  const isRunning = current?.status === 'running';
-  const isComplete = current?.status === 'complete';
+  const isRunning = phase !== 'complete' && phase !== 'error' && phase !== 'idle';
+  const isComplete = phase === 'complete';
+  const completedSteps = steps.filter(s => s.status === 'complete').length;
+  const totalSteps = steps.length;
+  const overallProgress = totalSteps > 0 ? Math.round((completedSteps / totalSteps) * 100) : 0;
 
-  // Compute overall progress
-  const overallProgress = isComplete ? 100 : (current?.progressPct || 0);
+  const phaseLabel = {
+    idle: 'Ready',
+    planning: 'Planning...',
+    reviewing: 'Reviewing plan...',
+    executing: `Executing step ${currentStepIndex}/${totalSteps}`,
+    completing: 'Compiling answer...',
+    complete: 'Complete',
+    error: 'Error',
+  }[phase];
 
   return (
     <div
@@ -50,7 +67,7 @@ export function ContinuousDisplay({ iterations, memory, onAbort }: ContinuousDis
       <div
         className="d-flex align-items-center gap-2 px-3 py-2"
         style={{
-          background: isComplete ? '#0f5132' : isRunning ? '#1a1e24' : '#1a1e24',
+          background: isComplete ? '#0f5132' : '#1a1e24',
           borderBottom: '1px solid #30363d',
         }}
       >
@@ -61,12 +78,12 @@ export function ContinuousDisplay({ iterations, memory, onAbort }: ContinuousDis
         <span style={{ color: '#e5e7eb', fontWeight: 600, fontSize: '0.9rem', flex: 1 }}>
           Continuous Mode
           <span style={{ color: '#8b949e', fontWeight: 400, marginLeft: 8, fontSize: '0.78rem' }}>
-            {iterations.length} iteration{iterations.length !== 1 ? 's' : ''}
+            {phaseLabel}
           </span>
         </span>
 
         {/* Progress bar */}
-        {!isComplete && (
+        {isRunning && totalSteps > 0 && (
           <div style={{ width: 100, height: 6, background: '#21262d', borderRadius: 3, overflow: 'hidden' }}>
             <div
               style={{
@@ -80,9 +97,11 @@ export function ContinuousDisplay({ iterations, memory, onAbort }: ContinuousDis
           </div>
         )}
 
-        <span style={{ color: '#8b949e', fontSize: '0.72rem' }}>
-          {overallProgress}%
-        </span>
+        {totalSteps > 0 && (
+          <span style={{ color: '#8b949e', fontSize: '0.72rem' }}>
+            {completedSteps}/{totalSteps}
+          </span>
+        )}
 
         {/* Memory toggle */}
         <button
@@ -141,149 +160,202 @@ export function ContinuousDisplay({ iterations, memory, onAbort }: ContinuousDis
         </div>
       )}
 
-      {/* ── Iterations ──────────────────────────────────── */}
+      {/* ── Plan summary ────────────────────────────────── */}
+      {planSummary && (
+        <div
+          style={{
+            background: '#161b22',
+            borderBottom: '1px solid #30363d',
+            padding: '8px 14px',
+          }}
+        >
+          <div style={{ color: '#d2a8ff', fontSize: '0.76rem', fontWeight: 600 }}>
+            <i className="bi bi-clipboard-check me-1" />Plan: {planSummary}
+          </div>
+        </div>
+      )}
+
+      {/* ── Steps list ──────────────────────────────────── */}
       <div style={{ padding: '8px 12px' }}>
-        {iterations.map((iter, idx) => (
-          <IterationCard key={idx} iteration={iter} isLast={idx === iterations.length - 1} />
+        {/* Planning spinner (before steps arrive) */}
+        {(phase === 'planning' || phase === 'reviewing') && steps.length === 0 && (
+          <div className="d-flex align-items-center gap-2 py-2">
+            <span className="spinner-border spinner-border-sm" style={{ width: 14, height: 14, borderWidth: 2, color: '#58a6ff' }} />
+            <span style={{ color: '#8b949e', fontSize: '0.82rem' }}>
+              {phase === 'planning' ? 'Creating execution plan...' : 'Reviewing plan...'}
+            </span>
+          </div>
+        )}
+
+        {steps.map((step) => (
+          <StepCard
+            key={step.index}
+            step={step}
+            isCurrent={step.index === currentStepIndex && isRunning}
+            isExpanded={expandedStep === step.index}
+            onToggle={() => setExpandedStep(expandedStep === step.index ? null : step.index)}
+          />
         ))}
+
+        {/* Completing spinner */}
+        {phase === 'completing' && (
+          <div className="d-flex align-items-center gap-2 py-2 mt-2" style={{ borderTop: '1px solid #21262d' }}>
+            <span className="spinner-border spinner-border-sm" style={{ width: 14, height: 14, borderWidth: 2, color: '#3fb950' }} />
+            <span style={{ color: '#8b949e', fontSize: '0.82rem' }}>Compiling final response...</span>
+          </div>
+        )}
       </div>
     </div>
   );
 }
 
-// ─── Single iteration card ───────────────────────────────────────
-function IterationCard({ iteration: iter, isLast }: { iteration: ContinuousIteration; isLast: boolean }) {
-  const isRunning = iter.status === 'running';
-  const isComplete = iter.status === 'complete';
-  const isError = iter.status === 'error';
+// ─── Single step card ────────────────────────────────────────────
+function StepCard({ step, isCurrent, isExpanded, onToggle }: {
+  step: ContinuousStep;
+  isCurrent: boolean;
+  isExpanded: boolean;
+  onToggle: () => void;
+}) {
+  const statusColor = {
+    pending: '#6b7280',
+    deciding: '#d29922',
+    executing: '#58a6ff',
+    complete: '#3fb950',
+    error: '#f85149',
+  }[step.status];
 
-  const statusColor = isRunning ? '#58a6ff' : isComplete ? '#3fb950' : isError ? '#f85149' : '#d29922';
-  const statusIcon = isRunning ? 'bi-arrow-repeat' : isComplete ? 'bi-check-circle' : isError ? 'bi-x-circle' : 'bi-arrow-right-circle';
+  const statusIcon = {
+    pending: 'bi-circle',
+    deciding: 'bi-search',
+    executing: 'bi-arrow-repeat',
+    complete: 'bi-check-circle-fill',
+    error: 'bi-x-circle-fill',
+  }[step.status];
+
+  const isActive = step.status === 'deciding' || step.status === 'executing';
 
   // Convert tool calls to terminal steps
-  const terminalSteps: TerminalStep[] = (iter.toolCalls || []).map((tc: any, i: number) => ({
+  const terminalSteps: TerminalStep[] = (step.toolCalls || []).map((tc: any, i: number) => ({
     stepIndex: i,
     action: tc.name,
     toolName: tc.name,
     args: tc.arguments || {},
     status: tc.status || 'success',
     result: tc.result,
-    startedAt: iter.startedAt,
-    finishedAt: iter.finishedAt,
+    startedAt: step.startedAt,
+    finishedAt: step.finishedAt,
   }));
+
+  const hasDetails = step.toolCalls.length > 0 || step.result;
+  const elapsed = step.startedAt && step.finishedAt
+    ? `${((step.finishedAt - step.startedAt) / 1000).toFixed(1)}s`
+    : null;
 
   return (
     <div
       style={{
-        marginBottom: 12,
+        marginBottom: 6,
         borderRadius: 6,
-        background: isLast && isRunning ? '#161b2266' : 'transparent',
-        border: isLast && isRunning ? '1px solid #1f6feb44' : 'none',
-        padding: isLast && isRunning ? 10 : 0,
+        background: isCurrent ? '#161b2244' : 'transparent',
+        border: isCurrent ? '1px solid #1f6feb33' : '1px solid transparent',
+        padding: '6px 8px',
+        cursor: hasDetails ? 'pointer' : 'default',
+        transition: 'background 0.15s',
       }}
+      onClick={hasDetails ? onToggle : undefined}
     >
-      {/* Iteration header */}
-      <div className="d-flex align-items-center gap-2 mb-2">
-        <i className={`bi ${statusIcon}`} style={{ color: statusColor, fontSize: '0.85rem' }} />
-        <span style={{ color: '#e5e7eb', fontWeight: 600, fontSize: '0.82rem' }}>
-          Iteration {iter.iteration}
+      {/* Step header */}
+      <div className="d-flex align-items-center gap-2">
+        {isActive ? (
+          <span className="spinner-border spinner-border-sm" style={{ width: 14, height: 14, borderWidth: 2, color: statusColor }} />
+        ) : (
+          <i className={`bi ${statusIcon}`} style={{ color: statusColor, fontSize: '0.85rem' }} />
+        )}
+
+        <span style={{
+          color: step.status === 'pending' ? '#6b7280' : '#e5e7eb',
+          fontWeight: 500,
+          fontSize: '0.82rem',
+          flex: 1,
+          opacity: step.status === 'pending' ? 0.6 : 1,
+        }}>
+          {step.index}. {step.description}
         </span>
-        {isRunning && (
-          <span className="spinner-border spinner-border-sm" style={{ width: 12, height: 12, borderWidth: 2, color: '#58a6ff' }} />
-        )}
-        {iter.progressPct > 0 && (
-          <span style={{ color: '#8b949e', fontSize: '0.7rem' }}>{iter.progressPct}%</span>
-        )}
-        {iter.finishedAt && iter.startedAt && (
-          <span style={{ color: '#6b7280', fontSize: '0.68rem', marginLeft: 'auto' }}>
-            {((iter.finishedAt - iter.startedAt) / 1000).toFixed(1)}s
+
+        {/* Walk mode badge */}
+        {step.walkMode && (
+          <span className="badge" style={{ background: '#a371f733', color: '#a371f7', fontSize: '0.62rem' }}>
+            🔍 walk
           </span>
+        )}
+
+        {/* Attempt badge */}
+        {step.attempt && step.attempt > 1 && (
+          <span className="badge" style={{ background: '#d2992233', color: '#d29922', fontSize: '0.62rem' }}>
+            attempt {step.attempt}
+          </span>
+        )}
+
+        {/* Category badge */}
+        {step.categories && step.categories.length > 0 && (
+          <span className="badge" style={{ background: '#1f6feb33', color: '#58a6ff', fontSize: '0.66rem' }}>
+            {step.categories[0]}
+          </span>
+        )}
+
+        {/* Tool count */}
+        {step.toolCalls.length > 0 && (
+          <span style={{ color: '#8b949e', fontSize: '0.68rem' }}>
+            <i className="bi bi-wrench me-1" />{step.toolCalls.length}
+          </span>
+        )}
+
+        {elapsed && (
+          <span style={{ color: '#6b7280', fontSize: '0.68rem' }}>{elapsed}</span>
+        )}
+
+        {hasDetails && (
+          <i
+            className={`bi bi-chevron-${isExpanded ? 'up' : 'down'}`}
+            style={{ color: '#6b7280', fontSize: '0.7rem' }}
+          />
         )}
       </div>
 
-      {/* Thinking */}
-      {iter.thinking && (
-        <div
-          style={{
-            background: '#1c2128',
-            borderRadius: 4,
-            padding: '6px 10px',
-            marginBottom: 8,
-            borderLeft: '3px solid #58a6ff',
-          }}
-        >
-          <div style={{ color: '#58a6ff', fontSize: '0.7rem', fontWeight: 600, marginBottom: 2 }}>
-            <i className="bi bi-lightbulb me-1" />THINKING
-          </div>
-          <div style={{ color: '#c9d1d9', fontSize: '0.76rem', lineHeight: 1.4 }}>
-            {iter.thinking.length > 300 ? iter.thinking.slice(0, 300) + '…' : iter.thinking}
-          </div>
+      {/* Retry reason */}
+      {step.retryReason && (
+        <div style={{ marginTop: 4, paddingLeft: 24, color: '#d29922', fontSize: '0.72rem', fontStyle: 'italic' }}>
+          <i className="bi bi-arrow-repeat me-1" />Retried: {step.retryReason}
         </div>
       )}
 
-      {/* Terminal steps — fully visible */}
-      {terminalSteps.length > 0 && (
-        <TerminalDisplay steps={terminalSteps} />
-      )}
+      {/* Expanded details */}
+      {isExpanded && (
+        <div style={{ marginTop: 8, paddingLeft: 24 }}>
+          {/* Tool calls via TerminalDisplay */}
+          {terminalSteps.length > 0 && (
+            <TerminalDisplay steps={terminalSteps} />
+          )}
 
-      {/* AI Reply — shown live as each iteration completes */}
-      {iter.reply && !isRunning && !isError && (
-        <div
-          style={{
-            background: '#1c2128',
-            borderRadius: 4,
-            padding: '6px 10px',
-            marginTop: 4,
-            borderLeft: '3px solid #8b949e',
-          }}
-        >
-          <div style={{ color: '#8b949e', fontSize: '0.7rem', fontWeight: 600, marginBottom: 2 }}>
-            <i className="bi bi-chat-left-text me-1" />RESPONSE
-          </div>
-          <div style={{ color: '#c9d1d9', fontSize: '0.76rem', lineHeight: 1.4, whiteSpace: 'pre-wrap' }}>
-            {iter.reply.length > 600 ? iter.reply.slice(0, 600) + '…' : iter.reply}
-          </div>
-        </div>
-      )}
-
-      {/* Summary / Reply */}
-      {iter.summary && !isRunning && (
-        <div
-          style={{
-            background: isComplete ? '#0f513222' : '#1c2128',
-            borderRadius: 4,
-            padding: '6px 10px',
-            marginTop: 4,
-            borderLeft: `3px solid ${isComplete ? '#3fb950' : '#d29922'}`,
-          }}
-        >
-          <div style={{ color: isComplete ? '#3fb950' : '#d29922', fontSize: '0.7rem', fontWeight: 600, marginBottom: 2 }}>
-            <i className={`bi ${isComplete ? 'bi-check2-all' : 'bi-card-text'} me-1`} />
-            {isComplete ? 'COMPLETE' : 'SUMMARY'}
-          </div>
-          <div style={{ color: '#c9d1d9', fontSize: '0.76rem', lineHeight: 1.4 }}>
-            {iter.summary}
-          </div>
-        </div>
-      )}
-
-      {/* Error banner */}
-      {isError && iter.reply && (
-        <div
-          style={{
-            background: '#f8514922',
-            borderRadius: 4,
-            padding: '6px 10px',
-            marginTop: 4,
-            borderLeft: '3px solid #f85149',
-          }}
-        >
-          <div style={{ color: '#f85149', fontSize: '0.7rem', fontWeight: 600, marginBottom: 2 }}>
-            <i className="bi bi-exclamation-triangle me-1" />ERROR — will retry
-          </div>
-          <div style={{ color: '#ffa198', fontSize: '0.74rem' }}>
-            {iter.reply.slice(0, 200)}
-          </div>
+          {/* Step result */}
+          {step.result && (
+            <div
+              style={{
+                background: '#1c2128',
+                borderRadius: 4,
+                padding: '6px 10px',
+                marginTop: 6,
+                borderLeft: `3px solid ${step.status === 'error' ? '#f85149' : '#3fb950'}`,
+              }}
+            >
+              <div style={{ color: '#8b949e', fontSize: '0.7rem', fontWeight: 600, marginBottom: 2 }}>
+                <i className="bi bi-chat-left-text me-1" />RESULT
+              </div>
+              <div style={{ color: '#c9d1d9', fontSize: '0.76rem', lineHeight: 1.4, whiteSpace: 'pre-wrap' }}>
+                {step.result.length > 600 ? step.result.slice(0, 600) + '…' : step.result}
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

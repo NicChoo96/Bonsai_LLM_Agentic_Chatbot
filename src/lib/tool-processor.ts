@@ -1,11 +1,16 @@
 import { getAllTools, executeTool } from './mcp/registry';
-import { sendChatCompletion, type CompletionMessage } from './ai-client';
+import { sendChatCompletion, type CompletionMessage, AI_CONTEXT_LIMIT, estimateMessagesTokens, compactMessages, truncateToTokens } from './ai-client';
 import type { ToolCall } from '@/types';
 
 // ─── Constants ───────────────────────────────────────────────────
 const MAX_TOOL_ITERATIONS = 15;
 const MAX_CONSECUTIVE_ERRORS = 3;
 const TOOL_CALL_REGEX = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
+
+/** Maximum tokens per individual tool result (chars ÷ 3.5). */
+const MAX_TOOL_RESULT_TOKENS = 1500;
+/** Keep messages under 70% of context to leave room for model response. */
+const CONTEXT_BUDGET_RATIO = 0.7;
 
 // Tools whose results should trigger the verification loop
 const VERIFIABLE_TOOLS = new Set([
@@ -107,9 +112,14 @@ export async function processToolCalls(
   for (const call of calls) {
     call.status = 'running';
     const result = await executeTool(call.name, call.arguments);
+    let resultStr = JSON.stringify(result.data ?? result.error, null, 2);
+
+    // Truncate oversized tool results to stay within token budget
+    resultStr = truncateToTokens(resultStr, MAX_TOOL_RESULT_TOKENS);
+
     results.push({
       ...call,
-      result: JSON.stringify(result.data ?? result.error, null, 2),
+      result: resultStr,
       status: result.success ? 'success' : 'error',
     });
   }
@@ -220,8 +230,15 @@ export async function runChatWithTools(
 ): Promise<{ reply: string; toolCalls: ToolCall[] }> {
   const allToolCalls: ToolCall[] = [];
   let consecutiveErrors = 0;
+  const tokenBudget = Math.floor(AI_CONTEXT_LIMIT * CONTEXT_BUDGET_RATIO);
 
   for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
+    // ── Proactive compaction: ensure messages fit within context ──
+    const currentTokens = estimateMessagesTokens(messages);
+    if (currentTokens > tokenBudget) {
+      messages = compactMessages(messages, tokenBudget);
+    }
+
     const response = await sendChatCompletion(messages);
     const assistantContent = response.choices[0]?.message?.content ?? '';
 
