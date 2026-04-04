@@ -400,11 +400,14 @@ const tools: McpToolDefinition[] = [
   },
   {
     name: 'open_app',
-    description: 'Launch a Windows application by name or path.',
+    description:
+      'Launch a Windows application or open a file with its default program. ' +
+      'If a file path is given, verifies the file exists first and detects file type. ' +
+      'Use full absolute paths (e.g. "C:\\Folder\\file.mp4"), NOT sandbox-relative paths.',
     parameters: {
       type: 'object',
       properties: {
-        app: { type: 'string', description: 'Application name or full path (e.g. "notepad", "calc", "code .").' },
+        app: { type: 'string', description: 'Application name or full absolute file path (e.g. "notepad", "calc", "E:\\Videos\\clip.mp4").' },
       },
       required: ['app'],
     },
@@ -1220,6 +1223,36 @@ async function execute(
       case 'open_app': {
         const app = args.app as string;
         if (!app) return { success: false, data: null, error: 'app is required' };
+
+        // If it looks like a file path (contains \ or / and an extension), verify it exists first
+        const looksLikePath = /[/\\]/.test(app) && /\.\w{1,10}$/.test(app);
+        if (looksLikePath) {
+          try {
+            const stats = await fs.stat(app);
+            const ext = path.extname(app).toLowerCase();
+            const sizeHuman = stats.size > 1048576
+              ? `${(stats.size / 1048576).toFixed(2)} MB`
+              : `${(stats.size / 1024).toFixed(2)} KB`;
+
+            await runCmd(`start "" "${app}"`);
+            return {
+              success: true,
+              data: {
+                launched: app,
+                fileType: ext,
+                size: sizeHuman,
+                isFile: stats.isFile(),
+              },
+            };
+          } catch (err: any) {
+            if (err.code === 'ENOENT') {
+              return { success: false, data: null, error: `File not found: "${app}". Use an absolute path (e.g. E:\\Folder\\file.ext), not a sandbox-relative path.` };
+            }
+            return { success: false, data: null, error: `Cannot open file: ${err.message}` };
+          }
+        }
+
+        // Plain app name (notepad, calc, etc.)
         await runCmd(`start "" "${app}"`);
         return { success: true, data: `Launched: ${app}` };
       }

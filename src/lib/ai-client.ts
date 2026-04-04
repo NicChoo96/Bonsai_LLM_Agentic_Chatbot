@@ -38,54 +38,99 @@ export function truncateToTokens(text: string, maxTokens: number): string {
 }
 
 /**
- * Compact a messages array to fit within a token budget.
- * Strategy: keep system (first) and last user message intact,
- * progressively truncate middle messages (oldest first).
+ * Compact a messages array by asking the AI to summarize the conversation.
+ *
+ * Keeps the system prompt (first message) and the latest user message intact.
+ * Everything in between is summarized by the model into 5-10% of AI_CONTEXT_LIMIT,
+ * then returned as a single "user" message containing the summary.
+ *
+ * Falls back to mechanical truncation if the AI summarization call itself fails.
  */
-export function compactMessages(
+export async function compactMessages(
+  messages: CompletionMessage[],
+  tokenBudget: number,
+): Promise<CompletionMessage[]> {
+  const total = estimateMessagesTokens(messages);
+  if (total <= tokenBudget) return messages;
+
+  // Target summary size: 5-10% of the context limit
+  const summaryMaxTokens = Math.floor(AI_CONTEXT_LIMIT * 0.08);
+
+  // Separate the parts we want to keep vs. summarize
+  const systemMsg = messages[0]; // always keep the system prompt
+  const lastMsg = messages[messages.length - 1]; // always keep the latest message
+  const middle = messages.slice(1, messages.length - 1); // everything to summarize
+
+  if (middle.length === 0) return messages; // nothing to compact
+
+  // Build a conversation transcript for the AI to summarize
+  const transcript = middle.map(
+    (m) => `[${m.role}]: ${m.content}`
+  ).join('\n\n---\n\n');
+
+  // Truncate the transcript mechanically first so the summarization call itself
+  // doesn't exceed context. Leave room for the system prompt + summary instructions.
+  const transcriptBudget = Math.floor(AI_CONTEXT_LIMIT * 0.6);
+  const safeTranscript = truncateToTokens(transcript, transcriptBudget);
+
+  try {
+    const summaryResponse = await sendChatCompletionRaw([
+      {
+        role: 'system',
+        content: [
+          'You are a conversation compactor. Summarize the following conversation transcript into a concise summary.',
+          `Your summary MUST be under ${summaryMaxTokens} tokens (~${Math.floor(summaryMaxTokens * 3.5)} characters).`,
+          '',
+          'RULES:',
+          '- Preserve ALL important facts: file paths, tool results, values found, errors encountered, decisions made.',
+          '- Preserve the sequence of events and what was accomplished vs. what failed.',
+          '- Drop verbose tool output details — keep only the key findings.',
+          '- Use dense bullet points, not full sentences.',
+          '- Output ONLY the summary, no preamble.',
+        ].join('\n'),
+      },
+      {
+        role: 'user',
+        content: `Summarize this conversation transcript:\n\n${safeTranscript}`,
+      },
+    ]);
+
+    const summary = summaryResponse.choices[0]?.message?.content ?? '';
+
+    if (summary.length > 0) {
+      console.log(`[ai-client] Compacted ${middle.length} messages (~${total} tokens) → summary (~${estimateTokens(summary)} tokens)`);
+      return [
+        systemMsg,
+        { role: 'user', content: `[Conversation Summary — previous messages compacted]:\n${summary}` },
+        lastMsg,
+      ];
+    }
+  } catch (err) {
+    console.warn('[ai-client] AI-based compaction failed, falling back to mechanical truncation:', err);
+  }
+
+  // ── Fallback: mechanical truncation if AI summary fails ──
+  return fallbackCompact(messages, tokenBudget);
+}
+
+/** Mechanical fallback: aggressively truncate and drop middle messages. */
+function fallbackCompact(
   messages: CompletionMessage[],
   tokenBudget: number,
 ): CompletionMessage[] {
   let total = estimateMessagesTokens(messages);
-  if (total <= tokenBudget) return messages;
-
   const result = [...messages];
 
-  // Phase 1: Truncate tool-result messages (user messages containing "[Tool Result:")
-  // Start from oldest (index 1) toward newest, skip the last message
+  // Truncate all middle messages to 150 tokens each
   for (let i = 1; i < result.length - 1 && total > tokenBudget; i++) {
-    const m = result[i];
-    if (m.role === 'user' && m.content.includes('[Tool Result:')) {
-      const before = estimateTokens(m.content);
-      // Summarize tool results: keep first 300 chars of each result block
-      const summarized = m.content.replace(
-        /\[Tool Result: (\S+)\] \(status: (\w+)\)\n([\s\S]*?)(?=\n\n\[Tool Result:|\n\n──|\n\n═|$)/g,
-        (_match, name: string, status: string, body: string) => {
-          const shortBody = body.length > 300
-            ? body.slice(0, 300) + '...[truncated]'
-            : body;
-          return `[Tool Result: ${name}] (status: ${status})\n${shortBody}`;
-        },
-      );
-      result[i] = { ...m, content: summarized };
-      total -= before - estimateTokens(summarized);
-    }
+    const before = estimateTokens(result[i].content);
+    const shortened = truncateToTokens(result[i].content, 150);
+    result[i] = { ...result[i], content: shortened };
+    total -= before - estimateTokens(shortened);
   }
 
-  // Phase 2: If still over, aggressively truncate assistant messages (middle ones)
-  for (let i = 1; i < result.length - 1 && total > tokenBudget; i++) {
-    const m = result[i];
-    if (m.role === 'assistant') {
-      const before = estimateTokens(m.content);
-      const shortened = truncateToTokens(m.content, 200);
-      result[i] = { ...m, content: shortened };
-      total -= before - estimateTokens(shortened);
-    }
-  }
-
-  // Phase 3: If STILL over, drop middle message pairs (oldest first)
+  // Drop middle messages oldest-first if still over
   while (result.length > 2 && total > tokenBudget) {
-    // Remove the second message (oldest after system prompt)
     const removed = result.splice(1, 1)[0];
     total -= estimateTokens(removed.content) + 4;
   }
@@ -113,6 +158,43 @@ export interface CompletionResponse {
   choices: CompletionChoice[];
 }
 
+/**
+ * Raw completion call — NO automatic compaction.
+ * Used internally by compactMessages to avoid infinite recursion.
+ */
+async function sendChatCompletionRaw(
+  messages: CompletionMessage[],
+): Promise<CompletionResponse> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
+
+  try {
+    const res = await fetch(`${AI_BASE_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timer);
+
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`AI request failed (${res.status}): ${text}`);
+    }
+
+    return res.json() as Promise<CompletionResponse>;
+  } catch (err) {
+    clearTimeout(timer);
+    throw err;
+  }
+}
+
+/**
+ * Send a chat completion with automatic token-overflow recovery.
+ * If the request exceeds context, compactMessages is called (AI-based
+ * summarization) and the request is retried.
+ */
 export async function sendChatCompletion(
   messages: CompletionMessage[],
 ): Promise<CompletionResponse> {
@@ -141,14 +223,13 @@ export async function sendChatCompletion(
           const errBody = JSON.parse(text);
           if (errBody?.error?.type === 'exceed_context_size_error' || errBody?.error?.message?.includes('exceeds the available context size')) {
             const nCtx = errBody.error.n_ctx || AI_CONTEXT_LIMIT;
-            // Compact to 70% of n_ctx to leave room for the model's response
             const budget = Math.floor(nCtx * 0.7);
-            const compacted = compactMessages(currentMessages, budget);
+            const compacted = await compactMessages(currentMessages, budget);
 
-            if (compacted.length < currentMessages.length || estimateMessagesTokens(compacted) < estimateMessagesTokens(currentMessages)) {
-              currentMessages = compacted;
+            if (estimateMessagesTokens(compacted) < estimateMessagesTokens(currentMessages)) {
               console.warn(`[ai-client] Token exceeded (${errBody.error.n_prompt_tokens}/${nCtx}). Compacted to ~${estimateMessagesTokens(compacted)} tokens, retrying...`);
-              continue; // retry with compacted messages
+              currentMessages = compacted;
+              continue;
             }
           }
         } catch { /* not JSON or not the expected error shape – fall through */ }

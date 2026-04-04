@@ -387,9 +387,17 @@ export async function POST(req: NextRequest) {
                 'When done, provide a clear summary of what was accomplished.',
               ].filter(Boolean).join('\n');
 
+              // Build explicit handoff from previous step
+              const prevResult = stepResults.length > 0
+                ? stepResults[stepResults.length - 1]
+                : null;
+              const handoff = prevResult
+                ? `\n\nPREVIOUS STEP OUTPUT (Step ${prevResult.index}: ${prevResult.description}):\n${prevResult.result.slice(0, 600)}`
+                : '';
+
               const execMessages: CompletionMessage[] = [
                 { role: 'system', content: execSystem },
-                { role: 'user', content: `Execute step ${stepIndex}: ${stepDesc}` },
+                { role: 'user', content: `Execute step ${stepIndex}: ${stepDesc}${handoff}` },
               ];
 
               sendEvent('exchange', { phase: `step-${stepIndex}-a${attempt}`, role: 'user', label: `Step ${stepIndex} exec (attempt ${attempt})`, content: execMessages[1].content });
@@ -488,11 +496,16 @@ export async function POST(req: NextRequest) {
               'Complete this step with a direct, thorough response.',
             ].filter(Boolean).join('\n');
 
+            const prevDirect = stepResults.length > 0 ? stepResults[stepResults.length - 1] : null;
+            const directHandoff = prevDirect
+              ? `\n\nPREVIOUS STEP OUTPUT (Step ${prevDirect.index}: ${prevDirect.description}):\n${prevDirect.result.slice(0, 600)}`
+              : '';
+
             sendEvent('exchange', { phase: `step-${stepIndex}`, role: 'user', label: `Step ${stepIndex} exec`, content: `Complete step ${stepIndex}: ${stepDesc}` });
 
             const directResponse = await sendChatCompletion([
               { role: 'system', content: directSystem },
-              { role: 'user', content: `Complete step ${stepIndex}: ${stepDesc}` },
+              { role: 'user', content: `Complete step ${stepIndex}: ${stepDesc}${directHandoff}` },
             ]);
 
             stepReply = directResponse.choices[0]?.message?.content ?? '';
@@ -509,11 +522,27 @@ export async function POST(req: NextRequest) {
             status: finalStatus,
           });
 
-          // Update memory with step result
+          // Update memory with step result + key tool output data
           memory += `\n## Step ${stepIndex}: ${stepDesc}\n`;
-          memory += `Result: ${stepReply.slice(0, 300)}\n`;
+          memory += `Result: ${stepReply.slice(0, 500)}\n`;
           if (stepToolCalls.length > 0) {
             memory += `Tools: ${stepToolCalls.map(tc => `${tc.name}(${tc.status})`).join(', ')}\n`;
+            // Extract key data from successful tool results (paths, files found, etc.)
+            const keyFindings = stepToolCalls
+              .filter(tc => tc.status === 'success' && tc.result)
+              .map(tc => {
+                const r = tc.result || '';
+                // Extract file/directory paths from results
+                const pathMatches = r.match(/[A-Z]:\\[^\s"',\]]+/g);
+                if (pathMatches?.length) return `  ${tc.name} found: ${pathMatches.slice(0, 5).join(', ')}`;
+                // Keep short results verbatim
+                if (r.length < 200) return `  ${tc.name}: ${r}`;
+                return `  ${tc.name}: ${r.slice(0, 150)}...`;
+              })
+              .filter(Boolean);
+            if (keyFindings.length > 0) {
+              memory += `Key findings:\n${keyFindings.join('\n')}\n`;
+            }
           }
 
           // ── COMPACT MEMORY if too long (keeps token usage low) ──

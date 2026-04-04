@@ -236,7 +236,7 @@ export async function runChatWithTools(
     // ── Proactive compaction: ensure messages fit within context ──
     const currentTokens = estimateMessagesTokens(messages);
     if (currentTokens > tokenBudget) {
-      messages = compactMessages(messages, tokenBudget);
+      messages = await compactMessages(messages, tokenBudget);
     }
 
     const response = await sendChatCompletion(messages);

@@ -302,7 +302,7 @@ export function ChatSessionPanel({ groups, open, onClose }: ChatSessionPanelProp
 }
 
 // ─── Helper: extract exchange groups from message history ─────────
-export function buildExchangeGroups(messages: { role: string; content: string; planState?: PlanState; toolCalls?: any[] }[]): ExchangeGroup[] {
+export function buildExchangeGroups(messages: { role: string; content: string; planState?: PlanState; toolCalls?: any[]; continuousState?: { phase: string; planSummary: string; steps: any[]; memory: string } }[]): ExchangeGroup[] {
   const groups: ExchangeGroup[] = [];
 
   for (const msg of messages) {
@@ -419,6 +419,77 @@ export function buildExchangeGroups(messages: { role: string; content: string; p
           role: 'assistant',
           label: 'Final response',
           content: msg.content,
+          phase: 'execute',
+        });
+      }
+    } else if (msg.role === 'assistant' && msg.continuousState) {
+      // ── Continuous mode: extract plan + step exchanges ──
+      const cs = msg.continuousState;
+
+      if (cs.planSummary) {
+        currentGroup.exchanges.push({
+          role: 'assistant',
+          label: 'Continuous plan',
+          content: cs.planSummary,
+          phase: 'plan',
+        });
+      }
+
+      for (const step of (cs.steps || [])) {
+        currentGroup.exchanges.push({
+          role: 'user',
+          label: `Step ${step.index}: ${step.description || ''}`,
+          content: `Execute step ${step.index}: ${step.description || ''}`,
+          phase: 'execute',
+        });
+
+        // Step tool calls
+        if (step.toolCalls?.length) {
+          for (const tc of step.toolCalls) {
+            currentGroup.exchanges.push({
+              role: 'assistant',
+              label: `Tool: ${tc.name}`,
+              content: JSON.stringify({ tool: tc.name, arguments: tc.arguments }, null, 2),
+              phase: 'execute',
+            });
+            if (tc.result) {
+              currentGroup.exchanges.push({
+                role: 'tool-result',
+                label: `${tc.name} → ${tc.status}`,
+                content: tc.result,
+                phase: 'execute',
+              });
+            }
+          }
+        }
+
+        // Step result
+        if (step.result) {
+          currentGroup.exchanges.push({
+            role: 'assistant',
+            label: `Step ${step.index} result`,
+            content: step.result,
+            phase: 'execute',
+          });
+        }
+      }
+
+      // Final reply
+      if (msg.content) {
+        currentGroup.exchanges.push({
+          role: 'assistant',
+          label: 'Final response',
+          content: msg.content,
+          phase: 'execute',
+        });
+      }
+
+      // Memory snapshot
+      if (cs.memory) {
+        currentGroup.exchanges.push({
+          role: 'tool-result',
+          label: 'Session memory',
+          content: cs.memory,
           phase: 'execute',
         });
       }

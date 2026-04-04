@@ -1073,6 +1073,29 @@ export function ChatInterface() {
 
   const handleSaveSession = async () => {
     const groups = buildExchangeGroups(messages);
+
+    // If we have live exchanges from continuous mode that haven't been saved yet,
+    // merge them into the last exchange group
+    if (liveExchanges.length > 0) {
+      const lastGroup = groups[groups.length - 1];
+      if (lastGroup) {
+        // Avoid duplicating the user prompt exchange
+        const existingLabels = new Set(lastGroup.exchanges.map(e => `${e.role}:${e.label}`));
+        for (const ex of liveExchanges) {
+          const key = `${ex.role}:${ex.label}`;
+          if (!existingLabels.has(key)) {
+            lastGroup.exchanges.push(ex);
+          }
+        }
+      } else {
+        groups.push({
+          userPrompt: liveExchanges.find(e => e.phase === 'input')?.content || '…',
+          timestamp: Date.now(),
+          exchanges: liveExchanges,
+        });
+      }
+    }
+
     const session = {
       version: 1,
       savedAt: new Date().toISOString(),
