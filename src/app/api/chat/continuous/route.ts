@@ -226,7 +226,7 @@ export async function POST(req: NextRequest) {
         sendEvent('exchange', { phase: 'review', role: 'assistant', label: 'Review response', content: reviewRaw });
 
         // ═══ PHASE 3: EXECUTE STEPS (with evaluation + retry + memory compaction) ═══
-        const MAX_STEP_ATTEMPTS = 3;
+        const MAX_STEP_ATTEMPTS = 2; // With pre-execution AI review, 2 attempts is enough
         const MEMORY_COMPACT_THRESHOLD = 1500;
         let memory = `# Session Memory\n**Objective:** ${userPrompt}\n**Plan:** ${planSummary}\n`;
         const stepResults: { index: number; description: string; result: string; toolCalls: any[] }[] = [];
@@ -634,9 +634,77 @@ export async function POST(req: NextRequest) {
                 return false;
               };
 
+              // ── Pre-execution AI review: validate tool calls before running them ──
+              const reviewToolCalls = async (proposed: ToolCall[], allPrevious: ToolCall[]): Promise<ToolCall[]> => {
+                if (proposed.length === 0) return proposed;
+
+                const proposedSummary = proposed.map(tc =>
+                  `- ${tc.name}(${JSON.stringify(tc.arguments)})`
+                ).join('\n');
+
+                const previousSummary = allPrevious.length > 0
+                  ? allPrevious.map(tc =>
+                    `- ${tc.name}(${tc.status}): ${(tc.result || '').slice(0, 150)}`
+                  ).join('\n')
+                  : 'None yet';
+
+                const reviewSystem = [
+                  'You are a tool call reviewer. Check proposed tool calls BEFORE they execute.',
+                  'Your job: catch obvious errors that will cause failures.',
+                  '',
+                  'CHECK FOR:',
+                  '1. Wrong paths — if a previous call resolved a path (e.g. "E:\\AI_Vids" → "E:\\Work\\...\\AI_Vids"), the new call MUST use the resolved path.',
+                  '2. Bad filter format — filter should be ".mp4" not "*.mp4" (no glob stars).',
+                  '3. Raw strings ending with backslash — r"path\\" is a Python SyntaxError.',
+                  '4. Calling a tool that already failed with similar args — suggest a different approach.',
+                  '5. Missing required arguments or using wrong argument names.',
+                  '6. Using a non-existent path when the real path was already found.',
+                  '',
+                  'SESSION CONTEXT:',
+                  memory.length > 50 ? memory.slice(0, 600) : 'No session data yet.',
+                  '',
+                  'PREVIOUS TOOL CALLS:',
+                  previousSummary,
+                  '',
+                  'Respond with JSON ONLY:',
+                  '{ "approved": [ { "index": 0, "action": "approve|fix|skip", "fixed_args": {...} or null, "reason": "brief" } ] }',
+                  'index = position in the proposed list (0-based).',
+                  'action: "approve" = run as-is, "fix" = run with fixed_args, "skip" = do not run.',
+                  'ONLY output JSON. Be concise.',
+                ].join('\n');
+
+                const reviewUser = `PROPOSED TOOL CALLS:\n${proposedSummary}`;
+
+                try {
+                  const reviewResp = await sendChatCompletion([
+                    { role: 'system', content: reviewSystem },
+                    { role: 'user', content: reviewUser },
+                  ]);
+                  const reviewRaw = reviewResp.choices[0]?.message?.content ?? '{}';
+                  sendEvent('exchange', { phase: `step-${stepIndex}-review`, role: 'assistant', label: `Step ${stepIndex} tool review`, content: reviewRaw });
+
+                  const review = JSON.parse(reviewRaw);
+                  const result: ToolCall[] = [];
+
+                  for (let idx = 0; idx < proposed.length; idx++) {
+                    const decision = review.approved?.find((a: any) => a.index === idx);
+                    if (!decision || decision.action === 'approve') {
+                      result.push(proposed[idx]);
+                    } else if (decision.action === 'fix' && decision.fixed_args) {
+                      result.push({ ...proposed[idx], arguments: { ...proposed[idx].arguments, ...decision.fixed_args } });
+                    }
+                    // 'skip' → not added to result
+                  }
+                  return result;
+                } catch {
+                  // Review failed to parse → proceed with original calls
+                  return proposed;
+                }
+              };
+
               const { reply, toolCalls } = await runChatWithTools(execMessages, (tc) => {
                 sendEvent('step_tool_call', { index: stepIndex, toolCall: tc, attempt });
-              }, { earlyExitCheck: execEarlyExitCheck, maxIterations: 8 });
+              }, { earlyExitCheck: execEarlyExitCheck, maxIterations: 8, beforeExecute: reviewToolCalls });
 
               stepReply = stripToolCallBlocks(reply || '');
               stepToolCalls.push(...toolCalls);

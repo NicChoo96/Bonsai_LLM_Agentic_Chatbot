@@ -263,6 +263,9 @@ export async function runChatWithTools(
     earlyExitCheck?: (toolCalls: ToolCall[]) => string | false;
     /** Override the default max iterations (15). */
     maxIterations?: number;
+    /** Called after dedup, before execution. Can modify/filter/cancel proposed tool calls.
+     *  Receives proposed calls + all previous calls for context. Returns the calls to actually execute. */
+    beforeExecute?: (proposed: ToolCall[], allPrevious: ToolCall[]) => Promise<ToolCall[]>;
   },
 ): Promise<{ reply: string; toolCalls: ToolCall[] }> {
   const allToolCalls: ToolCall[] = [];
@@ -378,8 +381,32 @@ export async function runChatWithTools(
     // Reset dedup counter when there are new (non-deduped) calls
     consecutiveDedupRounds = 0;
 
+    // ── beforeExecute hook: review/modify proposed calls before running them ──
+    let toExecute = deduped;
+    if (options?.beforeExecute && deduped.length > 0) {
+      try {
+        toExecute = await options.beforeExecute(deduped, allToolCalls);
+        // If review cancelled all calls, treat as if they were skipped
+        if (toExecute.length === 0) {
+          const skipMsg = 'Tool calls cancelled by pre-execution review.';
+          allToolCalls.push(...deduped.map(tc => ({
+            ...tc,
+            status: 'error' as const,
+            result: skipMsg,
+          })));
+          return {
+            reply: stripToolCallBlocks(assistantContent) || skipMsg,
+            toolCalls: allToolCalls,
+          };
+        }
+      } catch {
+        // If review itself fails, proceed with original calls
+        toExecute = deduped;
+      }
+    }
+
     // Execute tool calls — onToolCall fires immediately per tool completion
-    const executed = await processToolCalls(deduped, onToolCall);
+    const executed = await processToolCalls(toExecute, onToolCall);
     executed.push(...skippedErrors, ...cachedResults); // include deduped for context
     allToolCalls.push(...executed);
 
