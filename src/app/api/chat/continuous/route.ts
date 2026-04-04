@@ -10,6 +10,7 @@ import {
   getToolCategories,
 } from '@/lib/mcp';
 import { buildToolSystemPrompt, runChatWithTools, stripToolCallBlocks } from '@/lib/tool-processor';
+import type { ToolCall } from '@/types';
 import { readSandboxFile, ensureSandbox, listSandboxFiles } from '@/lib/sandbox';
 import { sendChatCompletion, type CompletionMessage } from '@/lib/ai-client';
 
@@ -56,8 +57,39 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  const skillContext = (skills || []).length > 0
-    ? `\nLoaded Skills:\n${skills.map((s) => `[Skill: ${s.name}]\n${s.content}`).join('\n---\n')}`
+  // Filter skills: only include those explicitly referenced in the user prompt
+  // or mentioned by another referenced skill. AI can request more later via plan steps.
+  const allSkills: { name: string; content: string }[] = skills || [];
+  const lowerPrompt = userPrompt.toLowerCase();
+  const referencedSkills = new Set<string>();
+
+  // Pass 1: find skills whose name appears in the user prompt
+  for (const s of allSkills) {
+    if (lowerPrompt.includes(s.name.toLowerCase())) {
+      referencedSkills.add(s.name);
+    }
+  }
+
+  // Pass 2: find skills referenced by already-selected skills
+  for (const s of allSkills) {
+    if (!referencedSkills.has(s.name)) continue;
+    const lc = s.content.toLowerCase();
+    for (const other of allSkills) {
+      if (other.name !== s.name && lc.includes(other.name.toLowerCase())) {
+        referencedSkills.add(other.name);
+      }
+    }
+  }
+
+  const activeSkills = allSkills.filter(s => referencedSkills.has(s.name));
+  const filteredSkillContext = activeSkills.length > 0
+    ? `\nActive Skills (follow these instructions):\n${activeSkills.map((s) => `[Skill: ${s.name}]\n${s.content}`).join('\n---\n')}`
+    : '';
+
+  // Provide a summary of available (but not loaded) skills so the AI knows they exist
+  const inactiveSkills = allSkills.filter(s => !referencedSkills.has(s.name));
+  const skillCatalog = inactiveSkills.length > 0
+    ? `\nAvailable skills (not loaded — mention by name if needed): ${inactiveSkills.map(s => s.name).join(', ')}`
     : '';
 
   // Tool categories for category-first selection
@@ -101,7 +133,8 @@ export async function POST(req: NextRequest) {
           '',
           `Sandbox files: [${fileList}]`,
           bootstrapContext,
-          skillContext,
+          filteredSkillContext,
+          skillCatalog,
           '',
           'Respond with JSON:',
           '{',
@@ -236,18 +269,19 @@ export async function POST(req: NextRequest) {
               memory.length > 100 ? `\nSession memory:\n${memory}` : '',
               '',
               'WALK MODE STRATEGY:',
-              '1. First try find_directory or walk_search — these use native Windows "dir | findstr" (like grep) to search fast across all drives.',
-              '2. If that fails, try search_files with different patterns, or glob_search with wildcards.',
-              '3. If found, use directory_tree to explore the found location and confirm it is correct.',
-              '4. NEVER give up after one empty result. Try broader terms, word-split the name, or search different drives.',
-              '5. When you FIND the target, state the full path clearly in your response.',
+              '1. First try find_directory or walk_search — these search fast across all drives.',
+              '2. If walk_search finds it, you have the path. Call directory_tree ONCE to list contents if needed.',
+              '3. STOP IMMEDIATELY after finding the target. State the full path clearly. Do NOT call extra tools after a successful find.',
+              '4. Only if walk_search returns ZERO results, try search_files or glob_search as fallbacks.',
+              '5. NEVER call the same tool twice with identical arguments.',
+              '6. NEVER call list_drives, host_file_exists, or run_command if walk_search already found the target.',
               '',
               `Sandbox files: [${fileList}]`,
               bootstrapContext,
               '',
               walkToolPrompt,
               '',
-              'Execute this step. Keep searching until you find the target or exhaust all options.',
+              'Once you find the target, state the full path and STOP. Do not make additional tool calls.',
             ].filter(Boolean).join('\n');
 
             const walkMessages: CompletionMessage[] = [
@@ -257,18 +291,78 @@ export async function POST(req: NextRequest) {
 
             sendEvent('exchange', { phase: `step-${stepIndex}-walk`, role: 'user', label: `Step ${stepIndex} walk mode`, content: walkMessages[1].content });
 
-            const { reply: walkReply, toolCalls: walkCalls } = await runChatWithTools(walkMessages, (tc) => {
-              sendEvent('step_tool_call', { index: stepIndex, toolCall: tc, walkMode: true });
-            });
+            // Early exit: check tool results for a found path after sufficient exploration
+            // We need walk_search to find the target AND at least one content-listing call
+            const walkEarlyExitCheck = (toolCalls: ToolCall[]): string | false => {
+              let foundPath = '';
+              let hasContentListing = false;
+
+              for (const tc of toolCalls) {
+                if (tc.status !== 'success' || !tc.result) continue;
+
+                // walk_search / find_directory returns results with paths
+                if (tc.name === 'walk_search' || tc.name === 'find_directory') {
+                  try {
+                    const data = JSON.parse(tc.result);
+                    if (data.count > 0 || (data.results && data.results.length > 0)) {
+                      foundPath = data.results?.[0]?.path || '';
+                    }
+                  } catch { /* not JSON, skip */ }
+                }
+
+                // Content listing tools (directory_tree or search_files after finding)
+                if (tc.name === 'directory_tree' || tc.name === 'search_files') {
+                  try {
+                    const data = JSON.parse(tc.result);
+                    if ((data.entryCount && data.entryCount > 0) || (data.count && data.count > 0)) {
+                      hasContentListing = true;
+                    }
+                  } catch { /* skip */ }
+                }
+              }
+
+              // Exit early once we have both the target location and content listing
+              if (foundPath && hasContentListing) {
+                return `Found target at: ${foundPath}`;
+              }
+              // Also exit if walk_search found it and we've done 3+ tool calls (enough exploring)
+              if (foundPath && toolCalls.length >= 3) {
+                return `Found target at: ${foundPath}`;
+              }
+              return false;
+            };
+
+            const { reply: walkReply, toolCalls: walkCalls } = await runChatWithTools(
+              walkMessages,
+              (tc) => {
+                sendEvent('step_tool_call', { index: stepIndex, toolCall: tc, walkMode: true });
+              },
+              { earlyExitCheck: walkEarlyExitCheck, maxIterations: 6 },
+            );
 
             stepReply = stripToolCallBlocks(walkReply || '');
             stepToolCalls = walkCalls;
 
             sendEvent('exchange', { phase: `step-${stepIndex}-walk`, role: 'assistant', label: `Step ${stepIndex} walk result`, content: stepReply });
 
-            // Evaluate walk result — if not found, do a second wider pass
-            const walkFound = stepReply.toLowerCase().includes('found') ||
-              stepReply.match(/[A-Z]:\\.+/) !== null;
+            // Evaluate walk result — check tool results first, then reply text
+            let walkFound = false;
+            for (const tc of walkCalls) {
+              if (tc.status !== 'success' || !tc.result) continue;
+              if (tc.name === 'walk_search' || tc.name === 'find_directory') {
+                try {
+                  const data = JSON.parse(tc.result);
+                  if (data.count > 0 || (data.results && data.results.length > 0)) {
+                    walkFound = true;
+                    break;
+                  }
+                } catch { /* skip */ }
+              }
+            }
+            // Fallback: check reply text for drive paths
+            if (!walkFound) {
+              walkFound = stepReply.match(/[A-Z]:\\.+/) !== null;
+            }
 
             if (!walkFound && walkCalls.length > 0) {
               sendEvent('step_retry', {
@@ -425,7 +519,8 @@ export async function POST(req: NextRequest) {
                 bootstrapContext,
                 '',
                 toolPrompt,
-                skillContext,
+                filteredSkillContext,
+                skillCatalog,
                 '',
                 'When done, provide a clear summary of what was accomplished.',
               ].filter(Boolean).join('\n');
@@ -534,7 +629,8 @@ export async function POST(req: NextRequest) {
               '',
               `Sandbox files: [${fileList}]`,
               bootstrapContext,
-              skillContext,
+              filteredSkillContext,
+              skillCatalog,
               '',
               'Complete this step with a direct, thorough response.',
             ].filter(Boolean).join('\n');

@@ -35,6 +35,10 @@ export function ContinuousDisplay({ phase, planSummary, steps, currentStepIndex,
   const [showMemory, setShowMemory] = useState(false);
   const [expandedStep, setExpandedStep] = useState<number | null>(null);
 
+  // Auto-expand the currently executing step so live tool calls are visible
+  const activeStep = steps.find(s => s.status === 'deciding' || s.status === 'executing');
+  const effectiveExpanded = activeStep ? activeStep.index : expandedStep;
+
   if (phase === 'idle' && steps.length === 0) return null;
 
   const isRunning = phase !== 'complete' && phase !== 'error' && phase !== 'idle';
@@ -192,7 +196,7 @@ export function ContinuousDisplay({ phase, planSummary, steps, currentStepIndex,
             key={step.index}
             step={step}
             isCurrent={step.index === currentStepIndex && isRunning}
-            isExpanded={expandedStep === step.index}
+            isExpanded={effectiveExpanded === step.index}
             onToggle={() => setExpandedStep(expandedStep === step.index ? null : step.index)}
           />
         ))}

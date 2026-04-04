@@ -107,6 +107,7 @@ export function parseToolCalls(content: string): ToolCall[] {
 // ─── Execute parsed tool calls ───────────────────────────────────
 export async function processToolCalls(
   calls: ToolCall[],
+  onToolCall?: (toolCall: ToolCall) => void,
 ): Promise<ToolCall[]> {
   const results: ToolCall[] = [];
   for (const call of calls) {
@@ -117,11 +118,15 @@ export async function processToolCalls(
     // Truncate oversized tool results to stay within token budget
     resultStr = truncateToTokens(resultStr, MAX_TOOL_RESULT_TOKENS);
 
-    results.push({
+    const completed: ToolCall = {
       ...call,
       result: resultStr,
       status: result.success ? 'success' : 'error',
-    });
+    };
+    results.push(completed);
+
+    // Notify caller immediately after each tool completes (live streaming)
+    if (onToolCall) onToolCall(completed);
   }
   return results;
 }
@@ -227,12 +232,19 @@ function buildVerificationPrompt(executed: ToolCall[]): string {
 export async function runChatWithTools(
   messages: CompletionMessage[],
   onToolCall?: (toolCall: ToolCall) => void,
+  options?: {
+    /** Check after each iteration; if it returns a truthy string, exit early with that as reply. */
+    earlyExitCheck?: (toolCalls: ToolCall[]) => string | false;
+    /** Override the default max iterations (15). */
+    maxIterations?: number;
+  },
 ): Promise<{ reply: string; toolCalls: ToolCall[] }> {
   const allToolCalls: ToolCall[] = [];
   let consecutiveErrors = 0;
   const tokenBudget = Math.floor(AI_CONTEXT_LIMIT * CONTEXT_BUDGET_RATIO);
+  const maxIter = options?.maxIterations ?? MAX_TOOL_ITERATIONS;
 
-  for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
+  for (let i = 0; i < maxIter; i++) {
     // ── Proactive compaction: ensure messages fit within context ──
     const currentTokens = estimateMessagesTokens(messages);
     if (currentTokens > tokenBudget) {
@@ -249,13 +261,16 @@ export async function runChatWithTools(
       return { reply: assistantContent, toolCalls: allToolCalls };
     }
 
-    // Execute tool calls
-    const executed = await processToolCalls(parsed);
+    // Execute tool calls — onToolCall fires immediately per tool completion
+    const executed = await processToolCalls(parsed, onToolCall);
     allToolCalls.push(...executed);
 
-    // Notify caller of each completed tool call for live streaming
-    if (onToolCall) {
-      for (const tc of executed) onToolCall(tc);
+    // Early exit check (e.g. walk mode found its target)
+    if (options?.earlyExitCheck) {
+      const exitReply = options.earlyExitCheck(allToolCalls);
+      if (exitReply) {
+        return { reply: exitReply, toolCalls: allToolCalls };
+      }
     }
 
     // Check if any calls errored

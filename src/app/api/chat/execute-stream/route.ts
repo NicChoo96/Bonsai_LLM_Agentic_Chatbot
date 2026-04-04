@@ -121,7 +121,7 @@ export async function POST(req: NextRequest) {
         ['sandbox_list_files', 'sandbox_read_file', 'search_files'].forEach((t) => planToolNames.add(t));
         const toolPrompt = buildToolSystemPrompt(planToolNames);
 
-        // Build skill context
+        // Build skill context — only include skills referenced by the plan
         const planSkills = (skills || []).filter(s => planSkillNames.has(s.name));
         const otherSkills = (skills || []).filter(s => !planSkillNames.has(s.name));
         let skillContext = '';
@@ -129,7 +129,7 @@ export async function POST(req: NextRequest) {
           skillContext += `\n\n═══ ACTIVE SKILLS (follow these instructions) ═══\n${planSkills.map((s) => `[Skill: ${s.name}]\n${s.content}`).join('\n---\n')}\n═══════════════════════════════════════════════════`;
         }
         if (otherSkills.length > 0) {
-          skillContext += `\n\nOther available skills:\n${otherSkills.map((s) => `[Skill: ${s.name}]\n${s.content}`).join('\n---\n')}`;
+          skillContext += `\n\nOther available skills (not loaded — mention by name if needed): ${otherSkills.map(s => s.name).join(', ')}`;
         }
 
         const planContext = plan?.steps?.length
