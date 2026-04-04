@@ -56,6 +56,8 @@ const DESTRUCTIVE_PATTERNS = [
 const MAX_OUTPUT = 4_000;
 /** Command timeout in milliseconds. */
 const CMD_TIMEOUT = 30_000;
+/** Shorter timeout for search/walk commands that should return fast. */
+const SEARCH_TIMEOUT = 15_000;
 
 // ─── Tool Definitions ────────────────────────────────────────────
 const tools: McpToolDefinition[] = [
@@ -92,6 +94,29 @@ const tools: McpToolDefinition[] = [
       properties: {
         script: { type: 'string', description: 'PowerShell script or one-liner to execute.' },
         cwd: { type: 'string', description: 'Working directory (absolute path on any drive). Defaults to user home.' },
+      },
+      required: ['script'],
+    },
+  },
+  {
+    name: 'run_python',
+    description:
+      'Execute a STANDALONE Python script on the system. The script runs in its own process and has NO access to MCP tools ' +
+      '(host_list_dir, open_app, etc. are NOT Python functions). Use standard Python libraries only: os, glob, random, json, pathlib, subprocess, etc. ' +
+      'Use this for tasks other tools cannot do: pick random files, batch rename, filter/sort, data processing, etc. ' +
+      'Print results to stdout. To open files use: import os; os.startfile(r"path"). To list dirs use: os.listdir(r"path"). ' +
+      'Example: import os, random; files = os.listdir(r"E:\\Folder"); chosen = random.sample(files, 2); print("\\n".join(chosen))',
+    parameters: {
+      type: 'object',
+      properties: {
+        script: {
+          type: 'string',
+          description: 'Standalone Python script. Use print() for output. Use os.listdir() to list files (NOT host_list_dir), os.startfile() to open files (NOT open_app). Available: os, sys, random, json, pathlib, glob, subprocess.',
+        },
+        cwd: {
+          type: 'string',
+          description: 'Working directory (absolute path). Defaults to user home.',
+        },
       },
       required: ['script'],
     },
@@ -402,8 +427,12 @@ const tools: McpToolDefinition[] = [
     name: 'open_app',
     description:
       'Launch a Windows application or open a file with its default program. ' +
-      'If a file path is given, verifies the file exists first and detects file type. ' +
-      'Use full absolute paths (e.g. "C:\\Folder\\file.mp4"), NOT sandbox-relative paths.',
+      'Uses Python os.startfile() for reliable file opening (works for videos, images, PDFs, etc.). ' +
+      'If given a DIRECTORY path instead of a file, returns a list of files in that directory so you can pick one. ' +
+      'If the file is not found, auto-searches nearby for similar filenames and suggests candidates. ' +
+      'Use full absolute paths (e.g. "C:\\Folder\\file.mp4"), NOT sandbox-relative paths. ' +
+      'IMPORTANT: You must know the actual filename — do NOT guess or invent filenames. ' +
+      'Use host_list_dir first to see what files exist, then open_app with an exact filename.',
     parameters: {
       type: 'object',
       properties: {
@@ -848,6 +877,87 @@ async function execute(
         return { success: true, data: result };
       }
 
+      case 'run_python': {
+        let script = args.script as string;
+        if (!script) return { success: false, data: null, error: 'script is required' };
+
+        // Block dangerous patterns
+        const dangerPatterns = [
+          /\bshutil\.rmtree\b/i,
+          /\bos\.remove\b.*\\\\/i,  // bulk delete on root paths
+          /\bsubprocess\..*\b(format|diskpart|shutdown)\b/i,
+          /\bimport\s+ctypes\b/i,
+          /\b__import__\b/i,
+          /\beval\s*\(/i,
+        ];
+        for (const pat of dangerPatterns) {
+          if (pat.test(script)) {
+            return { success: false, data: null, error: `Python script contains blocked pattern: ${pat.source}` };
+          }
+        }
+
+        // Detect MCP tool names used as Python function calls (common AI mistake)
+        const mcpToolNames = ['open_app', 'host_list_dir', 'host_read_file', 'host_write_file',
+          'host_copy', 'host_move', 'host_delete', 'host_create_dir', 'host_file_info',
+          'host_file_exists', 'walk_search', 'find_directory', 'search_files', 'search_in_files',
+          'sandbox_list_files', 'sandbox_read_file', 'sandbox_write_file', 'run_command',
+          'run_powershell', 'clipboard_read', 'clipboard_write'];
+        const usedMcpTools = mcpToolNames.filter(t => new RegExp(`\\b${t}\\s*\\(`).test(script));
+        if (usedMcpTools.length > 0) {
+          const alternatives: Record<string, string> = {
+            'open_app': 'os.startfile(r"path")',
+            'host_list_dir': 'os.listdir(r"path")',
+            'host_read_file': 'open(r"path").read()',
+            'host_write_file': 'open(r"path","w").write(content)',
+          };
+          const hints = usedMcpTools.map(t => alternatives[t] ? `${t}() → use ${alternatives[t]}` : `${t}() does not exist in Python`);
+          return {
+            success: false, data: null,
+            error: `Script calls MCP tool(s) as Python functions — these do NOT exist in Python! ` +
+              `Fix: ${hints.join('; ')}. ` +
+              `run_python runs STANDALONE Python. Use standard libraries: os, pathlib, glob, subprocess, json, random.`,
+          };
+        }
+
+        // Fix common AI escaping issues in path strings:
+        // 1. Double-backslash in raw strings: r'E:\\Work' → r'E:\Work' (AI over-escapes in JSON)
+        script = script.replace(/(r['"])((?:[^'"\\]|\\.)*)(['"])/g, (_match, prefix, body, suffix) => {
+          // Inside raw strings, replace \\\\ (two backslashes) with \\ (one backslash)
+          return prefix + body.replace(/\\\\/g, '\\') + suffix;
+        });
+
+        // Write script to a temp file and execute it
+        const tmpDir = os.tmpdir();
+        const tmpFile = path.join(tmpDir, `sandbox_py_${Date.now()}.py`);
+        try {
+          await fs.writeFile(tmpFile, script, 'utf-8');
+          const { stdout, stderr } = await execAsync(`python "${tmpFile}"`, {
+            cwd: (args.cwd as string) || DEFAULT_CWD,
+            timeout: CMD_TIMEOUT,
+            maxBuffer: 1024 * 1024,
+            windowsHide: true,
+          });
+          return {
+            success: true,
+            data: {
+              stdout: stdout.slice(0, MAX_OUTPUT),
+              stderr: stderr.slice(0, MAX_OUTPUT),
+            },
+          };
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          // Return the error but as a structured result so the AI can retry with a fixed script
+          return {
+            success: false,
+            data: null,
+            error: `Python execution failed: ${msg.slice(0, 1000)}. Fix the script and try again with run_python.`,
+          };
+        } finally {
+          // Clean up temp file
+          await fs.unlink(tmpFile).catch(() => {});
+        }
+      }
+
       // ── Drive discovery ────────────────────────────────────────
       case 'list_drives': {
         const result = await runPs(
@@ -879,13 +989,37 @@ async function execute(
         const resolveNote = resolved.suggestion ? `\n[Auto-resolved: ${resolved.suggestion}]` : '';
 
         if (isRecursive) {
+          // Use -First 100 (not 500) and -Depth 3 to avoid output exceeding MAX_OUTPUT
+          // which truncates the JSON mid-stream causing "Unexpected end of JSON input"
           const result = await runPs(
-            `Get-ChildItem -Path '${dirPath.replace(/'/g, "''")}' -Recurse -ErrorAction SilentlyContinue | ` +
+            `Get-ChildItem -Path '${dirPath.replace(/'/g, "''")}' -Recurse -Depth 3 -ErrorAction SilentlyContinue | ` +
             'Select-Object FullName, Name, Length, LastWriteTime, ' +
             '@{N="Type";E={if($_.PSIsContainer){"Directory"}else{"File"}}} ' +
-            '-First 500 | ConvertTo-Json',
+            '-First 100 | ConvertTo-Json',
           );
-          return { success: true, data: { items: JSON.parse(result.stdout || '[]'), resolvedPath: dirPath, note: resolveNote || undefined } };
+          try {
+            const items = JSON.parse(result.stdout || '[]');
+            return { success: true, data: { resolvedPath: dirPath, note: resolveNote || undefined, items: Array.isArray(items) ? items : [items] } };
+          } catch {
+            // JSON was truncated — fall back to non-recursive flat listing + note
+            const entries = await fs.readdir(dirPath, { withFileTypes: true });
+            const items = [];
+            for (const e of entries.slice(0, 200)) {
+              try {
+                const fullPath = path.join(dirPath, e.name);
+                const stat = await fs.stat(fullPath);
+                items.push({
+                  name: e.name,
+                  isDirectory: e.isDirectory(),
+                  size: e.isDirectory() ? null : stat.size,
+                  modified: stat.mtime.toISOString(),
+                });
+              } catch {
+                items.push({ name: e.name, isDirectory: e.isDirectory(), size: null, modified: null });
+              }
+            }
+            return { success: true, data: { resolvedPath: dirPath, note: (resolveNote || '') + ' [Recursive listing was too large; showing flat listing instead]', items } };
+          }
         }
 
         const entries = await fs.readdir(dirPath, { withFileTypes: true });
@@ -904,7 +1038,7 @@ async function execute(
             items.push({ name: e.name, isDirectory: e.isDirectory(), size: null, modified: null });
           }
         }
-        return { success: true, data: { items, resolvedPath: dirPath, note: resolveNote || undefined } };
+        return { success: true, data: { resolvedPath: dirPath, note: resolveNote || undefined, items } };
       }
 
       case 'host_read_file': {
@@ -1232,29 +1366,81 @@ async function execute(
         const app = args.app as string;
         if (!app) return { success: false, data: null, error: 'app is required' };
 
-        // If it looks like a file path (contains \ or / and an extension), verify it exists first
-        const looksLikePath = /[/\\]/.test(app) && /\.\w{1,10}$/.test(app);
+        // If it looks like a file/directory path (contains \ or /)
+        const looksLikePath = /[/\\]/.test(app);
         if (looksLikePath) {
+          // First check: is it a directory? → list its contents instead of failing
           try {
             const stats = await fs.stat(app);
+            if (stats.isDirectory()) {
+              const entries = await fs.readdir(app, { withFileTypes: true });
+              const fileList = entries.map(e => ({
+                name: e.name,
+                isDirectory: e.isDirectory(),
+                extension: e.isDirectory() ? null : path.extname(e.name).toLowerCase(),
+              }));
+              return {
+                success: false,
+                data: { path: app, files: fileList },
+                error: `"${app}" is a directory, not a file. Here are its contents (${fileList.length} items). Pick a specific file to open.`,
+              };
+            }
+
+            // It's a file — open it using Python os.startfile (works reliably for all file types on Windows)
             const ext = path.extname(app).toLowerCase();
             const sizeHuman = stats.size > 1048576
               ? `${(stats.size / 1048576).toFixed(2)} MB`
               : `${(stats.size / 1024).toFixed(2)} KB`;
 
-            await runCmd(`start "" "${app}"`);
+            const pyScript = `import os; os.startfile(r"${app.replace(/"/g, '\\"')}")`;
+            const pyTmpFile = path.join(os.tmpdir(), `sandbox_open_${Date.now()}.py`);
+            try {
+              await fs.writeFile(pyTmpFile, pyScript, 'utf-8');
+              await execAsync(`python "${pyTmpFile}"`, { timeout: 10000, windowsHide: true });
+            } finally {
+              await fs.unlink(pyTmpFile).catch(() => {});
+            }
+
             return {
               success: true,
               data: {
                 launched: app,
                 fileType: ext,
                 size: sizeHuman,
-                isFile: stats.isFile(),
+                isFile: true,
               },
             };
           } catch (err: any) {
             if (err.code === 'ENOENT') {
-              return { success: false, data: null, error: `File not found: "${app}". Use an absolute path (e.g. E:\\Folder\\file.ext), not a sandbox-relative path.` };
+              // File not found — use resolveOrSearch to find similar files
+              const resolved = await resolveOrSearch(app, 'file');
+              if (resolved.resolved) {
+                // Auto-open the resolved file
+                const ext = path.extname(resolved.resolved).toLowerCase();
+                const pyScript = `import os; os.startfile(r"${resolved.resolved.replace(/"/g, '\\"')}")`;
+                const pyTmpFile = path.join(os.tmpdir(), `sandbox_open_${Date.now()}.py`);
+                try {
+                  await fs.writeFile(pyTmpFile, pyScript, 'utf-8');
+                  await execAsync(`python "${pyTmpFile}"`, { timeout: 10000, windowsHide: true });
+                } finally {
+                  await fs.unlink(pyTmpFile).catch(() => {});
+                }
+                return {
+                  success: true,
+                  data: { launched: resolved.resolved, fileType: ext, autoResolved: resolved.suggestion },
+                };
+              }
+              // Not found and no auto-resolve — list parent directory if it exists
+              const parentDir = path.dirname(app);
+              let parentFiles: string[] = [];
+              try {
+                const entries = await fs.readdir(parentDir);
+                parentFiles = entries.slice(0, 50);
+              } catch { /* parent doesn't exist either */ }
+              const hint = parentFiles.length > 0
+                ? ` Files in "${parentDir}": ${parentFiles.join(', ')}`
+                : resolved.suggestion || '';
+              return { success: false, data: { candidates: resolved.candidates, parentFiles }, error: `File not found: "${app}".${hint}` };
             }
             return { success: false, data: null, error: `Cannot open file: ${err.message}` };
           }
@@ -1287,77 +1473,43 @@ async function execute(
           }
         }
 
-        // PASS 1: Fast native "dir /s /b /ad | findstr /i" — exact name match
         const allResults: { path: string; name: string; score: number; pass: string }[] = [];
 
-        for (const drive of drives) {
-          if (allResults.length >= maxResults) break;
+        // Helper: scan a single drive with a given findstr pattern, return matches
+        async function scanDrive(drive: string, findstrArg: string, score: number, pass: string) {
           try {
-            const cmd = `dir "${drive}\\" /s /b /ad 2>nul | findstr /i /e "\\\\${dirName}"`;
+            const cmd = `dir "${drive}\\" /s /b /ad 2>nul | findstr /i ${findstrArg}`;
             const result = await runCmd(cmd, drive + '\\');
             const lines = result.stdout.trim().split(/\r?\n/).filter(Boolean);
-            for (const line of lines) {
+            return lines.slice(0, maxResults).map(line => {
               const folderName = path.basename(line.trim());
-              const exactMatch = folderName.toLowerCase() === dirName.toLowerCase();
-              allResults.push({
-                path: line.trim(),
-                name: folderName,
-                score: exactMatch ? 100 : 90,
-                pass: 'exact-findstr',
-              });
-              if (allResults.length >= maxResults) break;
-            }
-          } catch { /* drive may be inaccessible or no results */ }
+              const isExact = folderName.toLowerCase() === dirName.toLowerCase();
+              return { path: line.trim(), name: folderName, score: isExact ? 100 : score, pass };
+            });
+          } catch { return []; }
         }
 
-        // PASS 2: Partial name match via findstr /i (contains)
+        // PASS 1: Exact name match — all drives in PARALLEL
+        const p1 = await Promise.all(drives.map(d => scanDrive(d, `/e "\\\\${dirName}"`, 90, 'exact-findstr')));
+        allResults.push(...p1.flat());
+
+        // PASS 2: Partial (contains) — parallel, only if pass 1 empty
         if (allResults.length === 0) {
-          for (const drive of drives) {
-            if (allResults.length >= maxResults) break;
-            try {
-              const cmd = `dir "${drive}\\" /s /b /ad 2>nul | findstr /i "${dirName}"`;
-              const result = await runCmd(cmd, drive + '\\');
-              const lines = result.stdout.trim().split(/\r?\n/).filter(Boolean);
-              for (const line of lines) {
-                const folderName = path.basename(line.trim());
-                allResults.push({
-                  path: line.trim(),
-                  name: folderName,
-                  score: 70,
-                  pass: 'partial-findstr',
-                });
-                if (allResults.length >= maxResults) break;
-              }
-            } catch { /* continue */ }
-          }
+          const p2 = await Promise.all(drives.map(d => scanDrive(d, `"${dirName}"`, 70, 'partial-findstr')));
+          allResults.push(...p2.flat());
         }
 
-        // PASS 3: Word-split search — search for each word
+        // PASS 3: Word-split — parallel per word, only if still empty
         if (allResults.length === 0) {
           const words = extractWords(dirName);
           for (const word of words) {
             if (allResults.length >= maxResults) break;
-            for (const drive of drives) {
-              if (allResults.length >= maxResults) break;
-              try {
-                const cmd = `dir "${drive}\\" /s /b /ad 2>nul | findstr /i "${word}"`;
-                const result = await runCmd(cmd, drive + '\\');
-                const lines = result.stdout.trim().split(/\r?\n/).filter(Boolean).slice(0, 10);
-                for (const line of lines) {
-                  const folderName = path.basename(line.trim());
-                  allResults.push({
-                    path: line.trim(),
-                    name: folderName,
-                    score: 50,
-                    pass: `word-"${word}"`,
-                  });
-                }
-              } catch { /* continue */ }
-            }
+            const p3 = await Promise.all(drives.map(d => scanDrive(d, `"${word}"`, 50, `word-"${word}"`)));
+            allResults.push(...p3.flat());
           }
         }
 
-        // Sort by score descending
+        // Sort by score descending, cap results
         allResults.sort((a, b) => b.score - a.score);
 
         return {
@@ -1380,7 +1532,7 @@ async function execute(
         const searchName = args.name as string;
         if (!searchName) return { success: false, data: null, error: 'name is required' };
         const searchType = (args.type as string) || 'directory';
-        const maxDepth = parseInt(args.max_depth as string) || 8;
+        const maxDepth = parseInt(args.max_depth as string) || 5;
         const maxResults = parseInt(args.max_results as string) || 10;
         const startPath = args.start_path as string | undefined;
 
@@ -1399,68 +1551,46 @@ async function execute(
           }
         }
 
-        const dirFlag = searchType === 'directory' ? '/ad' : searchType === 'file' ? '/a-d' : '';
-        const results: { path: string; name: string; drive: string; depth: number; foundAtPass: string }[] = [];
-        const walkedDrives: string[] = [];
+        type WalkHit = { path: string; name: string; drive: string; depth: number; foundAtPass: string };
 
-        // Progressive walk: depth 0 → 1 → 2 → …, checking all drives at each depth
-        // Like BFS: shallow everywhere first, then deeper
-        for (let depth = 0; depth <= maxDepth; depth++) {
-          if (results.length >= maxResults) break;
-
-          for (const drive of drives) {
-            if (results.length >= maxResults) break;
-
-            // Use native dir to list at specific depth, then grep
-            // For depth control we use PowerShell Get-ChildItem -Depth but via cmd for speed hybrid
-            try {
-              let cmd: string;
-              if (depth === 0) {
-                // Just check the root level
-                cmd = `dir "${drive}\\" /b ${dirFlag} 2>nul | findstr /i "${searchName}"`;
-              } else {
-                // Use PowerShell for depth-limited search (faster than full recursive)
-                const typeFilter = searchType === 'directory' ? '-Directory'
-                  : searchType === 'file' ? '-File'
-                  : '';
-                const psCmd =
-                  `Get-ChildItem -Path '${psEsc(drive)}\\' ${typeFilter} -Depth ${depth} -ErrorAction SilentlyContinue | ` +
-                  `Where-Object { $_.Name -like '*${psEsc(searchName)}*' } | ` +
-                  `Select-Object -First ${maxResults - results.length} -ExpandProperty FullName`;
-                const psResult = await runPs(psCmd);
-                const lines = psResult.stdout.trim().split(/\r?\n/).filter(Boolean);
-                for (const line of lines) {
-                  const itemName = path.basename(line.trim());
-                  // Avoid duplicates
-                  if (!results.some(r => r.path === line.trim())) {
-                    results.push({
-                      path: line.trim(),
-                      name: itemName,
-                      drive,
-                      depth,
-                      foundAtPass: `depth-${depth}`,
-                    });
-                  }
-                }
-                if (!walkedDrives.includes(drive)) walkedDrives.push(drive);
-                continue;
-              }
-
-              const result = await runCmd(cmd, drive + '\\');
-              const lines = result.stdout.trim().split(/\r?\n/).filter(Boolean);
-              for (const line of lines) {
-                results.push({
-                  path: path.join(drive + '\\', line.trim()),
-                  name: line.trim(),
-                  drive,
-                  depth: 0,
-                  foundAtPass: 'depth-0',
-                });
-              }
-              if (!walkedDrives.includes(drive)) walkedDrives.push(drive);
-            } catch { /* drive/depth inaccessible, continue */ }
-          }
+        // Search a single drive with ONE PowerShell call (no quadratic re-enumeration)
+        async function walkDrive(drive: string): Promise<WalkHit[]> {
+          const typeFilter = searchType === 'directory' ? '-Directory'
+            : searchType === 'file' ? '-File'
+            : '';
+          // Single Get-ChildItem -Recurse -Depth, filter by name, return path + depth
+          const psCmd =
+            `Get-ChildItem -Path '${psEsc(drive)}\\' ${typeFilter} -Recurse -Depth ${maxDepth} -ErrorAction SilentlyContinue | ` +
+            `Where-Object { $_.Name -like '*${psEsc(searchName)}*' } | ` +
+            `Select-Object -First ${maxResults} | ` +
+            `ForEach-Object { $rel = $_.FullName.Substring(${drive.length + 1}).TrimStart('\\'); ` +
+            `$d = ($rel -split '\\\\').Count - 1; "$d|$($_.FullName)" }`;
+          try {
+            const psResult = await runPs(psCmd);
+            const lines = psResult.stdout.trim().split(/\r?\n/).filter(Boolean);
+            return lines.map(line => {
+              const sep = line.indexOf('|');
+              const depth = sep > 0 ? parseInt(line.substring(0, sep)) || 0 : 0;
+              const fullPath = sep > 0 ? line.substring(sep + 1).trim() : line.trim();
+              return {
+                path: fullPath,
+                name: path.basename(fullPath),
+                drive,
+                depth,
+                foundAtPass: `depth-${depth}`,
+              };
+            });
+          } catch { return []; }
         }
+
+        // Run ALL drives in parallel — single PS process each
+        const driveResults = await Promise.all(drives.map(d => walkDrive(d)));
+        const results = driveResults.flat();
+
+        // Sort by depth ascending (shallowest first = BFS-like ordering)
+        results.sort((a, b) => a.depth - b.depth);
+
+        const walkedDrives = drives;
 
         return {
           success: true,

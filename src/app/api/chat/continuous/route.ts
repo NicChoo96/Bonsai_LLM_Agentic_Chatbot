@@ -295,7 +295,6 @@ export async function POST(req: NextRequest) {
             // We need walk_search to find the target AND at least one content-listing call
             const walkEarlyExitCheck = (toolCalls: ToolCall[]): string | false => {
               let foundPath = '';
-              let hasContentListing = false;
 
               for (const tc of toolCalls) {
                 if (tc.status !== 'success' || !tc.result) continue;
@@ -310,23 +309,18 @@ export async function POST(req: NextRequest) {
                   } catch { /* not JSON, skip */ }
                 }
 
-                // Content listing tools (directory_tree or search_files after finding)
-                if (tc.name === 'directory_tree' || tc.name === 'search_files') {
+                // Also extract from host_list_dir / directory_tree if they reveal the path
+                if (tc.name === 'host_list_dir' || tc.name === 'directory_tree') {
                   try {
                     const data = JSON.parse(tc.result);
-                    if ((data.entryCount && data.entryCount > 0) || (data.count && data.count > 0)) {
-                      hasContentListing = true;
-                    }
+                    if (data.resolvedPath) foundPath = foundPath || data.resolvedPath;
+                    else if (data.path) foundPath = foundPath || data.path;
                   } catch { /* skip */ }
                 }
               }
 
-              // Exit early once we have both the target location and content listing
-              if (foundPath && hasContentListing) {
-                return `Found target at: ${foundPath}`;
-              }
-              // Also exit if walk_search found it and we've done 3+ tool calls (enough exploring)
-              if (foundPath && toolCalls.length >= 3) {
+              // Exit IMMEDIATELY once we have the target path — no need to wait for more calls
+              if (foundPath) {
                 return `Found target at: ${foundPath}`;
               }
               return false;
@@ -342,6 +336,30 @@ export async function POST(req: NextRequest) {
 
             stepReply = stripToolCallBlocks(walkReply || '');
             stepToolCalls = walkCalls;
+
+            // Fallback: if stepReply is empty but tools found a path, synthesize from tool data
+            if (!stepReply) {
+              for (const tc of walkCalls) {
+                if (tc.status !== 'success' || !tc.result) continue;
+                if (tc.name === 'walk_search' || tc.name === 'find_directory') {
+                  try {
+                    const data = JSON.parse(tc.result);
+                    if (data.results?.[0]?.path) {
+                      stepReply = `Found target at: ${data.results[0].path}`;
+                      break;
+                    }
+                  } catch { /* skip */ }
+                }
+                // Also try extracting drive paths from any successful result
+                if (!stepReply && tc.result) {
+                  const pathMatch = tc.result.match(/[A-Z]:\\[^\s"',\]]+/g);
+                  if (pathMatch?.length) {
+                    stepReply = `Found path: ${pathMatch[0]}`;
+                    break;
+                  }
+                }
+              }
+            }
 
             sendEvent('exchange', { phase: `step-${stepIndex}-walk`, role: 'assistant', label: `Step ${stepIndex} walk result`, content: stepReply });
 
@@ -479,8 +497,8 @@ export async function POST(req: NextRequest) {
                 const selectedCat = categories.find(c => c.id === categoryId);
                 if (selectedCat) catToolNames.push(...selectedCat.toolNames);
               }
-              // Always include sandbox file tools as fallback
-              catToolNames.push('sandbox_list_files', 'sandbox_read_file');
+              // Always include sandbox file tools + run_python as universal fallback
+              catToolNames.push('sandbox_list_files', 'sandbox_read_file', 'run_python');
               // If step involves opening/launching, always include open_app + host_file_info
               if (/\b(open|launch|run|play|start|view)\b/i.test(stepDesc)) {
                 if (!catToolNames.includes('open_app')) catToolNames.push('open_app');
@@ -514,6 +532,11 @@ export async function POST(req: NextRequest) {
                 '- Use the MOST DIRECT tool for the task. Don\'t try multiple approaches if one clearly fits.',
                 '- To open a file → open_app. To read contents → host_read_file. To list files → host_list_dir.',
                 '- Prefer a single tool call over chaining multiple tools when possible.',
+                '- NEVER call the same tool on the same path twice. If you already have a file list, USE IT.',
+                '- If a tool result is truncated, work with the items shown. Do NOT re-call to get more.',
+                '- To pick random items from a list, just choose from what you have. No special tool is needed.',
+                '- ONLY use tools that are listed below. NEVER invent tools like host_select_file or host_random_file.',
+                '- If no existing tool does what you need, use run_python to write a short Python script. For example: pick N random files, filter by extension, rename in batch, etc.',
                 '',
                 `Sandbox files: [${fileList}]`,
                 bootstrapContext,
@@ -540,9 +563,30 @@ export async function POST(req: NextRequest) {
 
               sendEvent('exchange', { phase: `step-${stepIndex}-a${attempt}`, role: 'user', label: `Step ${stepIndex} exec (attempt ${attempt})`, content: execMessages[1].content });
 
+              const execEarlyExitCheck = (allCalls: ToolCall[]): string | false => {
+                // Count distinct successes for listing tools
+                const listSuccesses = allCalls.filter(tc =>
+                  tc.status === 'success' &&
+                  (tc.name === 'host_list_dir' || tc.name === 'directory_tree')
+                );
+                // If we've gotten a successful listing AND the AI has also tried
+                // at least one action tool (open_app, run_command, etc.) or made 4+ total calls,
+                // it means the AI has the data but is stuck — synthesize the result
+                const actionAttempts = allCalls.filter(tc =>
+                  tc.name !== 'host_list_dir' && tc.name !== 'directory_tree' &&
+                  tc.name !== 'host_read_file'
+                );
+                if (listSuccesses.length >= 1 && (actionAttempts.length >= 3 || allCalls.length >= 6)) {
+                  // Synthesize: return the successful listing data
+                  const listData = listSuccesses[0].result || '';
+                  return `Files found:\n${listData}`;
+                }
+                return false;
+              };
+
               const { reply, toolCalls } = await runChatWithTools(execMessages, (tc) => {
                 sendEvent('step_tool_call', { index: stepIndex, toolCall: tc, attempt });
-              });
+              }, { earlyExitCheck: execEarlyExitCheck, maxIterations: 8 });
 
               stepReply = stripToolCallBlocks(reply || '');
               stepToolCalls.push(...toolCalls);

@@ -34,7 +34,16 @@ export function estimateMessagesTokens(messages: CompletionMessage[]): number {
 export function truncateToTokens(text: string, maxTokens: number): string {
   const approxChars = Math.floor(maxTokens * 3.5);
   if (text.length <= approxChars) return text;
-  return text.slice(0, approxChars) + '\n\n[... truncated — output exceeded token limit ...]';
+
+  // Count total lines/items for context
+  const totalLines = text.split('\n').length;
+  const shownLines = text.slice(0, approxChars).split('\n').length;
+  const remaining = totalLines - shownLines;
+
+  return text.slice(0, approxChars) +
+    `\n\n[... ${remaining} more lines truncated. ${totalLines} total lines. ` +
+    `DO NOT re-call this tool — work with the data shown above. ` +
+    `If you need to pick random items, select from the items already listed.]`;
 }
 
 /**

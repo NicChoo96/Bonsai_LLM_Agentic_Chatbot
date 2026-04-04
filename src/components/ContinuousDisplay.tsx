@@ -33,11 +33,22 @@ interface ContinuousDisplayProps {
 // ─── Component ───────────────────────────────────────────────────
 export function ContinuousDisplay({ phase, planSummary, steps, currentStepIndex, memory, onAbort }: ContinuousDisplayProps) {
   const [showMemory, setShowMemory] = useState(false);
-  const [expandedStep, setExpandedStep] = useState<number | null>(null);
+  const [expandedSteps, setExpandedSteps] = useState<Set<number>>(new Set());
 
   // Auto-expand the currently executing step so live tool calls are visible
   const activeStep = steps.find(s => s.status === 'deciding' || s.status === 'executing');
-  const effectiveExpanded = activeStep ? activeStep.index : expandedStep;
+
+  const isStepExpanded = (index: number) =>
+    expandedSteps.has(index) || (activeStep?.index === index);
+
+  const toggleStep = (index: number) => {
+    setExpandedSteps(prev => {
+      const next = new Set(prev);
+      if (next.has(index)) next.delete(index);
+      else next.add(index);
+      return next;
+    });
+  };
 
   if (phase === 'idle' && steps.length === 0) return null;
 
@@ -196,8 +207,8 @@ export function ContinuousDisplay({ phase, planSummary, steps, currentStepIndex,
             key={step.index}
             step={step}
             isCurrent={step.index === currentStepIndex && isRunning}
-            isExpanded={effectiveExpanded === step.index}
-            onToggle={() => setExpandedStep(expandedStep === step.index ? null : step.index)}
+            isExpanded={isStepExpanded(step.index)}
+            onToggle={() => toggleStep(step.index)}
           />
         ))}
 

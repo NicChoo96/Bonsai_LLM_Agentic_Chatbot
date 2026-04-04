@@ -162,6 +162,9 @@ function buildErrorRecoveryPrompt(executed: ToolCall[]): string {
     '3. ACT: Make a new tool call using a corrected approach.',
     '',
     'Common recovery strategies:',
+    '- UNKNOWN TOOL → You invented a tool that does not exist! ONLY use tools listed in your prompt.',
+    '  → For random selection, listing files, opening files, or any custom logic: use run_python with standard Python (os.listdir, random.sample, os.startfile, etc.)',
+    '  → run_python runs STANDALONE Python — do NOT call MCP tools (host_list_dir, open_app) from inside Python scripts.',
     '- Wrong tool name → check available tools list and use the correct one',
     '- Wrong path → use sandbox_list_files to discover the correct path first',
     '- Missing file → create it, or check if a differently-named file exists',
@@ -178,10 +181,21 @@ function buildVerificationPrompt(executed: ToolCall[]): string {
   const checks: string[] = [];
 
   for (const tc of executed) {
-    if (!VERIFIABLE_TOOLS.has(tc.name)) continue;
-
     const result = tc.result || '';
     const args = tc.arguments || {};
+
+    // Catch unknown/invented tool names — these won't be in VERIFIABLE_TOOLS
+    if (tc.status === 'error' && result.includes('Unknown tool:')) {
+      checks.push(
+        `🚫 UNKNOWN TOOL: "${tc.name}" does not exist! You invented this tool.\n` +
+        `   → Use ONLY tools listed in your system prompt.\n` +
+        `   → For custom logic (random selection, batch ops, filtering): use run_python with standard Python.\n` +
+        `   → Example: run_python with script "import os, random; files = os.listdir(r'E:\\\\path'); print(random.choice(files))"`,
+      );
+      continue;
+    }
+
+    if (!VERIFIABLE_TOOLS.has(tc.name)) continue;
 
     if (tc.status === 'error') {
       checks.push(
@@ -228,6 +242,18 @@ function buildVerificationPrompt(executed: ToolCall[]): string {
   ].join('\n');
 }
 
+// ─── Fingerprint a tool call for dedup ───────────────────────────
+function toolCallFingerprint(tc: ToolCall): string {
+  return `${tc.name}::${JSON.stringify(tc.arguments)}`;
+}
+
+/** Key for success dedup — tool name + primary path/target arg (ignores flags like recursive, max_depth) */
+function toolCallBaseKey(tc: ToolCall): string {
+  const args = tc.arguments || {};
+  const primaryArg = (args as any).path || (args as any).name || (args as any).directory || (args as any).pattern || '';
+  return `${tc.name}::${primaryArg}`;
+}
+
 // ─── Main chat-with-tools loop ───────────────────────────────────
 export async function runChatWithTools(
   messages: CompletionMessage[],
@@ -241,8 +267,13 @@ export async function runChatWithTools(
 ): Promise<{ reply: string; toolCalls: ToolCall[] }> {
   const allToolCalls: ToolCall[] = [];
   let consecutiveErrors = 0;
+  let consecutiveDedupRounds = 0; // Track rounds where ALL calls were deduped
   const tokenBudget = Math.floor(AI_CONTEXT_LIMIT * CONTEXT_BUDGET_RATIO);
   const maxIter = options?.maxIterations ?? MAX_TOOL_ITERATIONS;
+  /** Track tool calls that already failed — skip if retried with identical args */
+  const failedFingerprints = new Map<string, string>(); // fingerprint → error message
+  /** Track successful tool calls by base key (tool+path) — return cached result instead of re-executing */
+  const successCache = new Map<string, ToolCall>(); // baseKey → completed ToolCall
 
   for (let i = 0; i < maxIter; i++) {
     // ── Proactive compaction: ensure messages fit within context ──
@@ -261,9 +292,113 @@ export async function runChatWithTools(
       return { reply: assistantContent, toolCalls: allToolCalls };
     }
 
+    // ── Dedup: skip tool calls that already failed with identical args ──
+    // ── Also skip SUCCESS calls to the same tool+path (AI re-calling with different flags) ──
+    const deduped: ToolCall[] = [];
+    const skippedErrors: ToolCall[] = [];
+    const cachedResults: ToolCall[] = [];
+    for (const tc of parsed) {
+      const fp = toolCallFingerprint(tc);
+      const baseKey = toolCallBaseKey(tc);
+
+      // Check failed dedup first (exact match)
+      const prevError = failedFingerprints.get(fp);
+      if (prevError) {
+        const skipped: ToolCall = {
+          ...tc,
+          status: 'error',
+          result: `SKIPPED (identical call already failed): ${prevError}`,
+        };
+        skippedErrors.push(skipped);
+        if (onToolCall) onToolCall(skipped);
+        continue;
+      }
+
+      // Check success dedup (same tool + primary arg, even if flags differ)
+      const prevSuccess = successCache.get(baseKey);
+      if (prevSuccess) {
+        const cached: ToolCall = {
+          ...tc,
+          status: 'success',
+          result: `CACHED (this tool already returned data for this path — use the results you already have):\n${(prevSuccess.result || '').slice(0, 500)}`,
+        };
+        cachedResults.push(cached);
+        if (onToolCall) onToolCall(cached);
+        continue;
+      }
+
+      deduped.push(tc);
+    }
+
+    // If ALL calls were deduped away, the model is stuck
+    if (deduped.length === 0 && (skippedErrors.length > 0 || cachedResults.length > 0)) {
+      consecutiveDedupRounds++;
+      allToolCalls.push(...skippedErrors, ...cachedResults);
+
+      // After 2 consecutive all-dedup rounds, HARD STOP — synthesize reply from cached data
+      if (consecutiveDedupRounds >= 2) {
+        const cachedData = [...successCache.values()]
+          .map(tc => `[${tc.name}] ${(tc.result || '').slice(0, 800)}`)
+          .join('\n\n');
+        return {
+          reply: cachedData
+            ? `Data already retrieved:\n${cachedData}`
+            : stripToolCallBlocks(assistantContent) || 'All tool calls were duplicates. Stopping.',
+          toolCalls: allToolCalls,
+        };
+      }
+
+      // First dedup round: give the AI ONE more chance with a strong "use what you have" instruction
+      if (cachedResults.length > 0) {
+        messages.push({ role: 'assistant', content: assistantContent });
+        const cachedContent = cachedResults
+          .map(tc => `[Tool Result: ${tc.name}] (status: ${tc.status})\n${tc.result}`)
+          .join('\n\n');
+        messages.push({
+          role: 'user',
+          content: [
+            `Tool results:\n\n${cachedContent}`,
+            '',
+            '═══ DUPLICATE TOOL CALL DETECTED ═══',
+            'You already have this data from a previous call. Do NOT call this tool again.',
+            'Use the data you already received to complete the task.',
+            'If you need to select random items, just pick from the list above.',
+            'Respond with your final answer NOW — no more tool calls.',
+            '═══════════════════════════════════════',
+          ].join('\n'),
+        });
+        continue;
+      }
+      return {
+        reply: stripToolCallBlocks(assistantContent) || 'All tool calls were duplicates of previous failures. Stopping to avoid an infinite loop.',
+        toolCalls: allToolCalls,
+      };
+    }
+
+    // Reset dedup counter when there are new (non-deduped) calls
+    consecutiveDedupRounds = 0;
+
     // Execute tool calls — onToolCall fires immediately per tool completion
-    const executed = await processToolCalls(parsed, onToolCall);
+    const executed = await processToolCalls(deduped, onToolCall);
+    executed.push(...skippedErrors, ...cachedResults); // include deduped for context
     allToolCalls.push(...executed);
+
+    // Track newly failed calls for future dedup
+    for (const tc of executed) {
+      if (tc.status === 'error' && !cachedResults.includes(tc)) {
+        failedFingerprints.set(toolCallFingerprint(tc), (tc.result || 'unknown error').slice(0, 200));
+      }
+    }
+
+    // Track successful calls for success dedup
+    for (const tc of deduped) {
+      if (tc.status === 'success') {
+        const baseKey = toolCallBaseKey(tc);
+        if (!successCache.has(baseKey)) {
+          successCache.set(baseKey, tc);
+        }
+      }
+    }
 
     // Early exit check (e.g. walk mode found its target)
     if (options?.earlyExitCheck) {
@@ -283,24 +418,17 @@ export async function runChatWithTools(
       consecutiveErrors = 0;
     }
 
-    // If we've had too many consecutive all-error rounds, force a rethink
+    // If we've had too many consecutive all-error rounds, STOP — don't keep looping
     if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-      messages.push({ role: 'assistant', content: assistantContent });
-      messages.push({
-        role: 'user',
-        content: [
-          `Tool results:\n\n${executed.map((tc) => `[Tool Result: ${tc.name}] (status: ${tc.status})\n${tc.result}`).join('\n\n')}`,
-          '',
-          '═══ CRITICAL: REPEATED FAILURES ═══',
-          `You have failed ${MAX_CONSECUTIVE_ERRORS} times in a row. STOP using the same approach.`,
-          'Take a completely different strategy. If the current tool doesn\'t work, try a different tool entirely.',
-          'If no tool can accomplish this specific sub-task, skip it and move on to the next step in the plan.',
-          'Explain what you accomplished so far and what could not be done.',
-          '═══════════════════════════════════',
-        ].join('\n'),
-      });
-      consecutiveErrors = 0;
-      continue;
+      // Build a meaningful reply from any successful calls we did get
+      const successes = allToolCalls.filter(tc => tc.status === 'success');
+      const successSummary = successes.length > 0
+        ? `Partial results from successful calls:\n${successes.map(tc => `- ${tc.name}: ${(tc.result || '').slice(0, 300)}`).join('\n')}`
+        : 'No tools succeeded.';
+      return {
+        reply: `Stopped after ${MAX_CONSECUTIVE_ERRORS} consecutive failures. ${successSummary}`,
+        toolCalls: allToolCalls,
+      };
     }
 
     // Feed assistant response + tool results back into the conversation

@@ -33,7 +33,8 @@ export async function executeTool(
       return provider.execute(toolName, args);
     }
   }
-  return { success: false, data: null, error: `Unknown tool: ${toolName}` };
+  const allNames = getAllTools().map(t => t.name);
+  return { success: false, data: null, error: `Unknown tool: ${toolName}. This tool does not exist. Available tools: [${allNames.join(', ')}]. Use run_python to write a standalone Python script if no existing tool fits.` };
 }
 
 // ─── Tool Categories ─────────────────────────────────────────────
@@ -68,8 +69,8 @@ export const TOOL_CATEGORIES: ToolCategory[] = [
   {
     id: 'shell_exec',
     label: 'Shell & Commands',
-    description: 'Run shell commands (cmd/PowerShell) and git operations anywhere on the system',
-    toolNames: ['run_command', 'run_powershell', 'git_command'],
+    description: 'Run shell commands (cmd/PowerShell/Python) and git operations anywhere on the system. Use run_python to execute generated scripts for tasks like picking random files, batch processing, data filtering, etc.',
+    toolNames: ['run_command', 'run_powershell', 'run_python', 'git_command'],
   },
   {
     id: 'web_http',
