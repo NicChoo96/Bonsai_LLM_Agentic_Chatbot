@@ -111,10 +111,28 @@ export async function POST(req: NextRequest) {
         // ═══ PHASE 1: CREATE PLAN ═══════════════════════════
         sendEvent('status', { phase: 'planning', message: 'Creating step-by-step plan...' });
 
+        // Build skill override block — placed at TOP of system prompt for maximum authority
+        const skillOverrideBlock = activeSkills.length > 0
+          ? [
+            '═══ ACTIVE SKILL INSTRUCTIONS (HIGHEST PRIORITY) ═══',
+            'The user has activated skill(s) that contain SPECIFIC INSTRUCTIONS for this task.',
+            'You MUST follow these instructions EXACTLY. They override general planning rules.',
+            'If a skill says "run this tool directly" or "do not plan" → create a SINGLE step with that exact tool call.',
+            'If a skill provides exact arguments (paths, params) → use them as-is in the plan description.',
+            '',
+            ...activeSkills.map(s => `[Skill: ${s.name}]\n${s.content}`),
+            '═══ END SKILL INSTRUCTIONS ═══',
+            '',
+          ].join('\n')
+          : '';
+
         const planSystem = [
           'You are a task planner. Break down the user\'s objective into concrete, actionable steps.',
           '',
+          skillOverrideBlock,
+          bootstrapContext ? `ATTACHED FILES:\n${bootstrapContext}\n` : '',
           'RULES:',
+          '- If an active skill provides a specific tool call to run, create a SINGLE STEP plan with needs_tool=true and include the exact tool+arguments in the step description.',
           '- Each step should be a single, focused action.',
           '- Steps should be in logical order with dependencies respected.',
           '- For each step, indicate if it likely needs a tool (file I/O, web requests, shell commands, etc.) or can be done directly (text generation, analysis, creative writing).',
@@ -129,13 +147,11 @@ export async function POST(req: NextRequest) {
           '- To FIND/SEARCH for files/folders → "search" + walk_mode: true',
           '- To READ/INSPECT file contents → "host_filesystem"',
           '- To RUN commands → "shell_exec"',
-          '- NEVER plan to copy host files into the sandbox — that is a security violation.',,
+          '- NEVER plan to copy host files into the sandbox — that is a security violation.',
           '',
           `Available tool categories:\n${categoryDocs}`,
           '',
           `Sandbox files: [${fileList}]`,
-          bootstrapContext,
-          filteredSkillContext,
           skillCatalog,
           '',
           'Respond with JSON:',
@@ -177,13 +193,15 @@ export async function POST(req: NextRequest) {
         const reviewSystem = [
           'You are a plan reviewer. Review and improve the task plan if needed.',
           '',
+          skillOverrideBlock,
           'Check for:',
-          '1. Missing steps that are needed to achieve the objective',
-          '2. Incorrect ordering or dependencies',
-          '3. Unnecessary steps that can be merged or removed',
-          '4. Correct tool category assignments — EVERY step with needs_tool=true MUST have a likely_category',
-          '5. Steps that require finding/locating files or folders on the host system should have "walk_mode": true',
-          '6. SECURITY: No step should copy host files into the sandbox. To open a file, use "desktop_utils" category.',
+          '1. SKILL COMPLIANCE — If an active skill provides specific instructions (e.g. "run this tool directly", exact args), the plan MUST follow them. A skill saying "do not plan" means the plan should be 1 step.',
+          '2. Missing steps that are needed to achieve the objective',
+          '3. Incorrect ordering or dependencies',
+          '4. Unnecessary steps that can be merged or removed — especially if a skill already provides the exact tool call',
+          '5. Correct tool category assignments — EVERY step with needs_tool=true MUST have a likely_category',
+          '6. Steps that require finding/locating files or folders on the host system should have "walk_mode": true',
+          '7. SECURITY: No step should copy host files into the sandbox. To open a file, use "desktop_utils" category.',
           '',
           'CATEGORY REFERENCE:',
           '- "desktop_utils" → open/launch/play files or apps (open_app tool). Also handles opening random files from a directory with count/random/filter params — don\'t split this into separate steps.',
@@ -531,6 +549,7 @@ export async function POST(req: NextRequest) {
               const execSystem = [
                 `You are executing step ${stepIndex} of a plan.${attempt > 1 ? ` (Attempt ${attempt} — previous approach failed, use the NEW tools)` : ''}`,
                 '',
+                skillOverrideBlock,
                 `OBJECTIVE: "${userPrompt}"`,
                 `CURRENT STEP: ${stepDesc}`,
                 memoryContext,
@@ -543,6 +562,7 @@ export async function POST(req: NextRequest) {
                 '- Use paths exactly as found by previous steps (from session memory or handoff).',
                 '',
                 'EFFICIENCY:',
+                '- If an active skill provides EXACT tool arguments, use them DIRECTLY. Do not search or discover — just call the tool.',
                 '- Use the MOST DIRECT tool for the task. Don\'t try multiple approaches if one clearly fits.',
                 '- To open a file → open_app. To read contents → host_read_file. To list files → host_list_dir.',
                 '- Prefer a single tool call over chaining multiple tools when possible.',
@@ -556,7 +576,6 @@ export async function POST(req: NextRequest) {
                 bootstrapContext,
                 '',
                 toolPrompt,
-                filteredSkillContext,
                 skillCatalog,
                 '',
                 'OUTPUT FORMAT — You MUST end your response with a JSON block containing the key data from this step:',
