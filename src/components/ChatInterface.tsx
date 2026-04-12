@@ -54,7 +54,7 @@ export function ChatInterface() {
   const [historyFile, setHistoryFile] = useState<{ path: string; data: any } | null>(null);
   const [subAgentRuns, setSubAgentRuns] = useState<SubAgentRun[]>([]);
   const [liveExchanges, setLiveExchanges] = useState<Exchange[]>([]);
-  const [chatMode, setChatMode] = useState<ChatMode>('plan');
+  const [chatMode, setChatMode] = useState<ChatMode>('continuous');
   const [activeWorkflowInfo, setActiveWorkflowInfo] = useState<ActiveWorkflowInfo | null>(null);
   const [showWorkflowEditor, setShowWorkflowEditor] = useState(false);
   const [continuousPhase, setContinuousPhase] = useState<ContinuousPhase>('idle');
@@ -877,12 +877,39 @@ export function ChatInterface() {
               case 'step_start': {
                 const idx = data.index;
                 setContinuousCurrentStep(idx);
-                setContinuousSteps(prev => prev.map(s =>
-                  s.index === idx ? { ...s, status: 'executing' as const, startedAt: Date.now() } : s
-                ));
-                finalSteps = finalSteps.map(s =>
-                  s.index === idx ? { ...s, status: 'executing' as const, startedAt: Date.now() } : s
-                );
+                // Dynamic steps: add if not present, update if exists
+                setContinuousSteps(prev => {
+                  const exists = prev.some(s => s.index === idx);
+                  if (exists) {
+                    return prev.map(s =>
+                      s.index === idx ? { ...s, status: 'executing' as const, description: data.description || s.description, startedAt: Date.now() } : s
+                    );
+                  }
+                  return [...prev, {
+                    index: idx,
+                    description: data.description || `Step ${idx}`,
+                    status: 'executing' as const,
+                    needsTool: true,
+                    toolCalls: [],
+                    startedAt: Date.now(),
+                  }];
+                });
+                finalSteps = (() => {
+                  const exists = finalSteps.some(s => s.index === idx);
+                  if (exists) {
+                    return finalSteps.map(s =>
+                      s.index === idx ? { ...s, status: 'executing' as const, description: data.description || s.description, startedAt: Date.now() } : s
+                    );
+                  }
+                  return [...finalSteps, {
+                    index: idx,
+                    description: data.description || `Step ${idx}`,
+                    status: 'executing' as const,
+                    needsTool: true,
+                    toolCalls: [],
+                    startedAt: Date.now(),
+                  }];
+                })();
                 break;
               }
 
@@ -1184,20 +1211,20 @@ export function ChatInterface() {
         {/* ── Mode switcher ──────────────────────────── */}
         <div className="btn-group btn-group-sm" role="group">
           <button
-            className={`btn ${chatMode === 'plan' ? 'btn-info' : 'btn-outline-secondary'}`}
-            onClick={() => setChatMode('plan')}
-            disabled={loading}
-            title="Plan mode: 4-phase pipeline (understand → gather → plan → execute)"
-          >
-            <i className="bi bi-list-check me-1"></i>Plan
-          </button>
-          <button
             className={`btn ${chatMode === 'continuous' ? 'btn-warning' : 'btn-outline-secondary'}`}
             onClick={() => setChatMode('continuous')}
             disabled={loading}
             title="Continuous mode: fast iterative loop"
           >
             <i className="bi bi-lightning-charge-fill me-1"></i>Continuous
+          </button>
+          <button
+            className={`btn ${chatMode === 'plan' ? 'btn-info' : 'btn-outline-secondary'}`}
+            onClick={() => setChatMode('plan')}
+            disabled={loading}
+            title="Plan mode: 4-phase pipeline (understand → gather → plan → execute)"
+          >
+            <i className="bi bi-list-check me-1"></i>Plan
           </button>
         </div>
         {/* ── Active workflow indicator + editor button ── */}

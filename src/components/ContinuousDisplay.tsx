@@ -60,11 +60,11 @@ export function ContinuousDisplay({ phase, planSummary, steps, currentStepIndex,
 
   const phaseLabel = {
     idle: 'Ready',
-    planning: 'Planning...',
-    reviewing: 'Reviewing plan...',
-    executing: `Executing step ${currentStepIndex}/${totalSteps}`,
+    planning: 'Thinking...',
+    reviewing: 'Evaluating...',
+    executing: `Iteration ${currentStepIndex}`,
     completing: 'Compiling answer...',
-    complete: 'Complete',
+    complete: `Complete (${completedSteps} iterations)`,
     error: 'Error',
   }[phase];
 

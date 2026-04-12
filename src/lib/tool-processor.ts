@@ -50,25 +50,50 @@ export function buildToolSystemPrompt(selectedTools?: Set<string>): string {
     .join('\n\n');
 
   return `
-You have access to the following tools. To call a tool, include a tool-call block:
+You have access to tools. Structure EVERY response using this format:
+
+<message>
+Your natural language reasoning, explanation, or response goes here.
+Describe what you're doing, what you found, or your analysis.
+</message>
+
+To use a tool, add tool_call blocks AFTER your message:
 
 <tool_call>
-{"tool": "tool_name", "arguments": {"path": "value"}}
+{"tool": "tool_name", "arguments": {"param": "value"}}
 </tool_call>
 
+You can include multiple <tool_call> blocks in one response.
+
+EXAMPLE — using a tool:
+<message>
+I'll search for the folder on your drives.
+</message>
+
+<tool_call>
+{"tool": "walk_search", "arguments": {"name": "MyFolder", "type": "directory"}}
+</tool_call>
+
+EXAMPLE — after getting results (no more tools needed):
+<message>
+Found it! The folder is at E:\\Games\\MyFolder.
+It contains 12 files including setup.exe.
+</message>
+
 RULES:
-- ALWAYS use tools when asked. NEVER refuse or say you cannot.
-- Sandbox file paths are RELATIVE to sandbox root (e.g. "skills.txt", not "/workspace/sandbox/skills.txt").
-- If unsure whether a file exists, call sandbox_list_files first.
+- ALWAYS wrap your text response in <message> tags.
+- ALWAYS use tools when the task requires real actions (file I/O, search, open apps, run commands). NEVER fabricate or hallucinate results.
 - You may call multiple tools in one response.
 - ONLY use tools listed below. NEVER invent tool names.
+- Sandbox file paths are RELATIVE to sandbox root (e.g. "skills.txt").
+- If unsure whether a file exists, call sandbox_list_files first.
+- NEVER pretend a tool succeeded or make up file paths, process IDs, or other system data.
 
 RESULT VERIFICATION:
-- After search tools: verify file extensions and names actually match what you need. Don't accept wrong matches.
-- After file ops: verify the path resolved correctly, especially if auto-resolved.
-- If results look wrong: try different patterns/tools. Don't give up after one attempt.
-- If uncertain: tell the user and ask for confirmation.
-- NEVER hallucinate tools that don't exist.
+- After search tools: verify results actually match what you need.
+- After file ops: verify the path resolved correctly.
+- If results look wrong: try different patterns/tools.
+- NEVER hallucinate or fabricate tool results.
 
 ## Available Tools
 
@@ -133,7 +158,10 @@ export async function processToolCalls(
 
 // ─── Strip tool-call XML blocks from visible content ─────────────
 export function stripToolCallBlocks(content: string): string {
-  return content.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '').trim();
+  return content
+    .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '')  // remove tool call blocks
+    .replace(/<\/?message>/g, '')  // strip message tags, keep content
+    .trim();
 }
 
 // ─── Build error-recovery prompt for failed tool calls ──────────
