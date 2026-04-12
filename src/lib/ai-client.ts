@@ -5,6 +5,9 @@
 const AI_BASE_URL = process.env.AI_BASE_URL || 'http://localhost:8080';
 const AI_TIMEOUT_MS = 120_000;  // 2 minutes per request
 const AI_MAX_RETRIES = 3;
+const MODEL_NAME = process.env.MODEL_NAME;
+
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 /** Maximum context size in tokens – matches the running model's n_ctx. */
 export const AI_CONTEXT_LIMIT = parseInt(process.env.AI_CONTEXT_LIMIT || '16384', 10);
@@ -107,7 +110,6 @@ export async function compactMessages(
     const summary = summaryResponse.choices[0]?.message?.content ?? '';
 
     if (summary.length > 0) {
-      console.log(`[ai-client] Compacted ${middle.length} messages (~${total} tokens) → summary (~${estimateTokens(summary)} tokens)`);
       return [
         systemMsg,
         { role: 'user', content: `[Conversation Summary — previous messages compacted]:\n${summary}` },
@@ -180,8 +182,16 @@ async function sendChatCompletionRaw(
   try {
     const res = await fetch(`${AI_BASE_URL}/v1/chat/completions`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages }),
+      headers: { 
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${process.env.AI_API_KEY || ''}`,
+       },
+      body: JSON.stringify({ 
+        // 1. You MUST specify the model here
+        model: MODEL_NAME,
+        messages: messages,
+        stream: false 
+      }),
       signal: controller.signal,
     });
 
@@ -217,8 +227,15 @@ export async function sendChatCompletion(
     try {
       const res = await fetch(`${AI_BASE_URL}/v1/chat/completions`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: currentMessages }),
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.AI_API_KEY || ''}`,
+        },
+        body: JSON.stringify({ 
+          model: MODEL_NAME,
+          messages: currentMessages,
+          stream: false,
+        }),
         signal: controller.signal,
       });
 
@@ -249,6 +266,11 @@ export async function sendChatCompletion(
       return res.json() as Promise<CompletionResponse>;
     } catch (err: unknown) {
       clearTimeout(timer);
+      // Log the full error including cause (undici wraps network errors)
+      console.error(`[ai-client] Fetch error (attempt ${attempt}/${AI_MAX_RETRIES}):`, err);
+      if (err instanceof Error && 'cause' in err) {
+        console.error(`[ai-client] Cause:`, (err as any).cause);
+      }
       const isAbort = err instanceof DOMException && err.name === 'AbortError';
       const isTimeout = isAbort || (err instanceof Error && err.message.includes('abort'));
       lastError = isTimeout

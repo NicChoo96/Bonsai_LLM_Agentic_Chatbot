@@ -4,3 +4,4 @@ todo/
 sandbox/
 .env.local
 tsconfig.tsbuildinfo
+*.env*
